@@ -2,10 +2,10 @@
 // Config/Release.xcconfig — Release（对外）
 //
 // 由 project.yml 的 configFiles 绑定到 Release configuration。
-// .invalid 是 RFC 2606 保留域名，只作占位；上线前必须换成真实 https 地址。
+// 默认地址 = 生产网关 https://dsh.yansuu1.xyz；配对密钥不进包，由用户在配对页输入。
 // 保持 `/$()/` 写法：xcconfig 会把裸 "//" 当行注释。
 //
 
 BUNDLE_ID = com.personalos.ios
 
-POS_SERVER_URL = https:/$()/api.example.invalid
+POS_SERVER_URL = https:/$()/dsh.yansuu1.xyz
