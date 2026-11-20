@@ -1,0 +1,14 @@
+# macOS / Xcode
+.DS_Store
+build/
+DerivedData/
+*.xcresult
+*.ipa
+Payload/
+
+# 工程生成物（XcodeGen 生成，不提交）
+*.xcodeproj
+*.xcworkspace
+
+# 节点（云端/插件阶段会用到）
+node_modules/

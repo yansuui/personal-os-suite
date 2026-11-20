@@ -1,0 +1,162 @@
+# POSApp — XcodeGen 工程定义（唯一工程事实源；.xcodeproj 不入库）。
+#
+# 接口契约：CONTRACT.md（只读）。本文件只负责「工程 + 交付链路」。
+#   - target：POSCore / POSFeatures / POSApp / POSCoreTests
+#   - configuration：Debug / Staging / Release，分别绑定 Config/*.xcconfig
+#   - POSApp 的 Info.plist 由下面的 info: 内联生成（POSServerURL + ATS 本地例外）
+#
+# 生成方式（macOS / GitHub Actions）：xcodegen generate
+
+name: POSApp
+
+options:
+  bundleIdPrefix: com.personalos
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  groupSortPosition: top
+  minimumXcodeGenVersion: "2.38.0"
+
+# configuration → Xcode 预设（debug / release）映射
+# CONTRACT-GAP: CONTRACT.md 未定义 configuration 集合（§5 只说 Debug/Release 的 ATS 差异，
+# 任务描述写「四个」但只列出三个名字）。这里按 Debug / Staging / Release 三个实现，
+# Staging 走 release 预设（优化 + 无 DEBUG 条件），只有服务器地址不同。
+configs:
+  Debug: debug
+  Staging: release
+  Release: release
+
+# BUNDLE_ID / POS_SERVER_URL 定义在下面三个文件里
+configFiles:
+  Debug: Config/Debug.xcconfig
+  Staging: Config/Staging.xcconfig
+  Release: Config/Release.xcconfig
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"                  # CONTRACT §1：Swift 5.x 语言模式
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"    # CONTRACT §1：最低 iOS 17.0
+    SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    TARGETED_DEVICE_FAMILY: "1"           # 仅 iPhone
+    MARKETING_VERSION: "0.1.0"            # CONTRACT §1：0.1.0（build 1）
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+
+targets:
+
+  # ---------------------------------------------------------------- 核心层（B）
+  POSCore:
+    type: framework
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources/POSCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BUNDLE_ID).core"
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+
+  # ---------------------------------------------------------------- 界面层（C）
+  POSFeatures:
+    type: framework
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources/POSFeatures
+    dependencies:
+      - target: POSCore
+        embed: false            # POSFeatures 只链接 POSCore，嵌入统一交给 POSApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BUNDLE_ID).features"
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+
+  # ---------------------------------------------------------------- App（A）
+  POSApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources/POSApp
+        excludes:
+          - Info.plist          # 由下面的 info: 生成，不能当资源文件打包
+    dependencies:
+      - target: POSCore
+        embed: true
+      - target: POSFeatures
+        embed: true
+    settings:
+      base:
+        PRODUCT_NAME: POSApp
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BUNDLE_ID)"
+        ENABLE_PREVIEWS: YES
+    info:
+      path: Sources/POSApp/Info.plist
+      properties:
+        # CONTRACT-GAP: CONTRACT §1/§5 未规定 CFBundleDisplayName 与启动屏形态，
+        # 本次取 PersonalOS + 系统默认启动屏；如需统一文案请先改 CONTRACT。
+        CFBundleDisplayName: PersonalOS
+        CFBundleName: PersonalOS
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        # 仅竖屏
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # xcconfig 注入：Debug = http://127.0.0.1:3080（见 Config/Debug.xcconfig）
+        POSServerURL: "$(POS_SERVER_URL)"
+        # 本地联调：真机要连局域网网关（http://192.168.x.x:3080），而 XcodeGen 的 info:
+        # 无法按 configuration 生成不同 plist。这里放开任意明文，换取配对不踩 ATS 坑；
+        # TODO(发布前)：拆 Debug/Release 两份 plist，Release 收敛为「仅 https」。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: false
+
+  # ---------------------------------------------------------------- 单元测试（B）
+  POSCoreTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests/POSCoreTests
+    dependencies:
+      - target: POSCore
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BUNDLE_ID).coretests"
+        GENERATE_INFOPLIST_FILE: YES
+        # CONTRACT-GAP: CONTRACT 未说明 POSCoreTests 是否带 TEST_HOST；测试只依赖
+        # POSCore（不依赖 POSApp），这里配成无宿主的逻辑测试包（不设 TEST_HOST）。
+
+schemes:
+  POSApp:
+    build:
+      targets:
+        POSApp: all
+        POSCoreTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      coverageTargets:
+        - POSCore
+      targets:
+        - name: POSCoreTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

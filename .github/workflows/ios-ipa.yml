@@ -1,0 +1,179 @@
+name: ios-ipa
+
+# 触发方式：
+#   1) push 到 main（自动出包）
+#   2) pull_request（只验证测试 + 构建）
+#   3) workflow_dispatch（手动出包，不用等 push）
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-unsigned-ipa
+    # macos-15 = Xcode 16.x，满足 Swift 5.10 / iOS 17 目标
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 仓库根可能在上一层（monorepo: apps/iphone/），这里自动定位工程目录。
+      - name: 定位工程目录
+        id: locate
+        run: |
+          set -euo pipefail
+          if [ -f "${GITHUB_WORKSPACE}/project.yml" ]; then
+            dir="${GITHUB_WORKSPACE}"
+          elif [ -f "${GITHUB_WORKSPACE}/apps/iphone/project.yml" ]; then
+            dir="${GITHUB_WORKSPACE}/apps/iphone"
+          else
+            echo "::error::找不到 project.yml（期望在仓库根或 apps/iphone/）"
+            find "${GITHUB_WORKSPACE}" -maxdepth 3 -name project.yml -print || true
+            exit 1
+          fi
+          echo "dir=${dir}" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=${dir}" >> "$GITHUB_ENV"
+          echo "工程目录: ${dir}"
+
+      - name: 打印环境信息
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          xcodebuild -showsdks || true
+          sw_vers
+
+      - name: 安装 XcodeGen
+        run: |
+          set -euo pipefail
+          if brew list --versions xcodegen >/dev/null 2>&1; then
+            echo "XcodeGen 已预装，跳过 brew install"
+          else
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          xcodegen generate --spec project.yml
+          test -d POSApp.xcodeproj
+          xcodebuild -list -project POSApp.xcodeproj
+
+      # 先打印可用模拟器，再按 iPhone 16 → iPhone 15 → … 回退。
+      - name: 选择模拟器
+        id: simulator
+        run: |
+          set -euo pipefail
+          echo "== xcrun simctl list devices available =="
+          xcrun simctl list devices available
+          device=""
+          for candidate in "iPhone 16" "iPhone 15" "iPhone 14" "iPhone SE (3rd generation)"; do
+            if xcrun simctl list devices available | grep -Fq "${candidate} ("; then
+              device="$candidate"
+              break
+            fi
+          done
+          if [ -z "$device" ]; then
+            device="$(xcrun simctl list devices available \
+              | sed -n 's/^[[:space:]]*\(iPhone[^(]*\)(.*/\1/p' \
+              | head -n 1 \
+              | sed 's/[[:space:]]*$//')"
+          fi
+          if [ -z "$device" ]; then
+            echo "::error::没有可用的 iPhone 模拟器（见上面的 simctl 输出）"
+            exit 1
+          fi
+          echo "simulator=${device}" >> "$GITHUB_OUTPUT"
+          echo "选中模拟器: ${device}"
+
+      - name: 运行 POSCoreTests
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p build
+          xcodebuild test \
+            -project POSApp.xcodeproj \
+            -scheme POSApp \
+            -destination "platform=iOS Simulator,name=${{ steps.simulator.outputs.simulator }}" \
+            -derivedDataPath build/DerivedData \
+            | tee build/test.log
+
+      - name: 无签名 Release 构建
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p build
+          xcodebuild \
+            -project POSApp.xcodeproj \
+            -scheme POSApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build/build-release.log
+
+      - name: 打包 unsigned IPA
+        id: package
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          app="build/Build/Products/Release-iphoneos/POSApp.app"
+          if [ ! -d "$app" ]; then
+            echo "::error::找不到 ${app}"
+            ls -R build/Build/Products 2>/dev/null | head -n 80 || true
+            exit 1
+          fi
+          rm -rf Payload POSApp-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$app" Payload/POSApp.app
+          /usr/bin/zip -qry POSApp-unsigned.ipa Payload
+          ls -lh POSApp-unsigned.ipa
+          unzip -l POSApp-unsigned.ipa | head -n 30 || true
+          exec_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' Payload/POSApp.app/Info.plist)"
+          test -f "Payload/POSApp.app/${exec_name}"
+          echo "CFBundleIdentifier = $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/POSApp.app/Info.plist)"
+          echo "CFBundleShortVersionString = $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/POSApp.app/Info.plist)"
+          echo "POSServerURL = $(/usr/libexec/PlistBuddy -c 'Print :POSServerURL' Payload/POSApp.app/Info.plist)"
+          echo "ipa=${PROJECT_DIR}/POSApp-unsigned.ipa" >> "$GITHUB_OUTPUT"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: POSApp-unsigned-ipa
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # 失败时补充 SDK / 版本信息，方便定位 runner 与工程配置不匹配的问题。
+      - name: 失败诊断
+        if: failure()
+        run: |
+          set +e
+          echo "== xcodebuild -version =="
+          xcodebuild -version
+          echo "== 可用 SDK =="
+          xcodebuild -showsdks
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "== 可用模拟器 =="
+          xcrun simctl list devices available
+          echo "== 测试日志尾部 =="
+          tail -n 150 "${PROJECT_DIR:-.}/build/test.log" 2>/dev/null
+          echo "== 构建日志尾部 =="
+          tail -n 150 "${PROJECT_DIR:-.}/build/build-release.log" 2>/dev/null
+          exit 0

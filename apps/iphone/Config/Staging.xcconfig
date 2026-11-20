@@ -1,0 +1,11 @@
+//
+// Config/Staging.xcconfig — Staging（预发布）
+//
+// 由 project.yml 的 configFiles 绑定到 Staging configuration。
+// .invalid 是 RFC 2606 保留域名，永远不会解析成功 —— 用作占位地址，
+// 部署前替换成真实的 https 地址（记得保留 `/$()/` 写法，否则 "//" 会被当注释）。
+//
+
+BUNDLE_ID = com.personalos.ios
+
+POS_SERVER_URL = https:/$()/staging.example.invalid

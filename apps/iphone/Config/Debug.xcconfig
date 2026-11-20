@@ -1,0 +1,17 @@
+//
+// Config/Debug.xcconfig — Debug（本机联调）
+//
+// 由 project.yml 的 configFiles 绑定到 Debug configuration。
+// 注意：xcconfig 里 "//" 会被当成行注释，所以 URL 必须用 `$()` 拆开，
+//       赋值后 Xcode 会把 `$()` 展开成空串，最终值仍是 http://127.0.0.1:3080。
+//
+
+BUNDLE_ID = com.personalos.ios
+
+// Debug 默认连本机 personal-os 服务（模拟器与宿主机共享回环地址）。
+// 真机联调改成局域网地址，例如：
+//   POS_SERVER_URL = http:/$()/192.168.1.10:3080
+POS_SERVER_URL = http:/$()/127.0.0.1:3080
+
+// Debug 编译条件；AppConfig 的 #if DEBUG 靠它生效。
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) DEBUG
