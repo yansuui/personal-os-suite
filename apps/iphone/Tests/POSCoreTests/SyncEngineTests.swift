@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 import POSCore
 
@@ -7,10 +8,17 @@ final class SyncEngineTests: XCTestCase {
 
     func testMessagesThenCursorAndEmptyPageKeepsCursor() async throws {
         let thirdRequest = expectation(description: "空页后继续使用游标 2")
+        let thirdResponseGate = DispatchSemaphore(value: 0)
+        defer { thirdResponseGate.signal() }
         var calls = 0
         URLProtocolStubRegistry.shared.setHandler { request in
             calls += 1
-            if calls == 3 { thirdRequest.fulfill() }
+            if calls == 3 {
+                thirdRequest.fulfill()
+                // 在第三个长轮询仍在途时停止，避免即时空页抢跑出第四次请求。
+                let gateResult = thirdResponseGate.wait(timeout: .now() + 5)
+                XCTAssertEqual(gateResult, .success, "第三次响应屏障应由 stop 后主动解除")
+            }
             let after = Int(request.stubQueryValue("after") ?? "0") ?? 0
             if after == 0 {
                 return .json(200, Fixtures.messagePage(messages: [
@@ -27,6 +35,7 @@ final class SyncEngineTests: XCTestCase {
         let consumer = Task { for await event in stream { recorder.append(event) } }
         await fulfillment(of: [thirdRequest], timeout: 5)
         await engine.stop()
+        thirdResponseGate.signal()
         await consumer.value
         XCTAssertEqual(recorder.messageIDs, ["m1", "assistant-1"])
         XCTAssertEqual(recorder.firstCursor, 2)
