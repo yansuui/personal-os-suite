@@ -95,6 +95,56 @@ final class ErrorMappingTests: XCTestCase {
         }
     }
 
+    func testPublicHealthAuthOrMissingRouteReportsV2Unavailable() async throws {
+        for status in [401, 403, 404] {
+            URLProtocolStubRegistry.shared.reset()
+            URLProtocolStubRegistry.shared.setHandler { _ in
+                .json(status, #"{"error":{"code":"unauthorized","message":"需要有效的设备 token"}}"#)
+            }
+
+            do {
+                _ = try await api.health()
+                XCTFail("公开 health 返回 \(status) 应提示 v2 不可用")
+            } catch let error as POSAPIError {
+                guard case let .server(actualStatus, code, message) = error else {
+                    return XCTFail("服务不兼容不能误报为配对密钥错误，实际 \(error)")
+                }
+                XCTAssertEqual(actualStatus, status)
+                XCTAssertEqual(code, "v2_unavailable")
+                XCTAssertTrue(message.contains("v2"))
+            }
+            let requests = URLProtocolStubRegistry.shared.requests
+            XCTAssertEqual(requests.count, 1, "不能向旧版接口自动回退")
+            XCTAssertEqual(requests.first?.stubPath, "/v2/health")
+            XCTAssertNil(requests.first?.value(forHTTPHeaderField: "authorization"))
+            XCTAssertNil(requests.first?.value(forHTTPHeaderField: "x-pair-secret"))
+        }
+    }
+
+    func testHealthServerFailureRetainsItsActualError() async throws {
+        URLProtocolStubRegistry.shared.setHandler { _ in
+            .json(503, #"{"error":{"code":"maintenance","message":"Try later"}}"#)
+        }
+        do {
+            _ = try await api.health()
+            XCTFail("503 应抛错")
+        } catch let error as POSAPIError {
+            XCTAssertEqual(error, .server(status: 503, code: "maintenance", message: "Try later"))
+        }
+    }
+
+    func testMissingConversationRetainsNotFoundError() async throws {
+        URLProtocolStubRegistry.shared.setHandler { _ in
+            .json(404, #"{"error":{"code":"not_found","message":"Conversation not found."}}"#)
+        }
+        do {
+            _ = try await api.messages(session, conversationID: Fixtures.conversationID, after: 0, waitSeconds: 0)
+            XCTFail("会话不存在应抛错")
+        } catch let error as POSAPIError {
+            XCTAssertEqual(error, .server(status: 404, code: "not_found", message: "Conversation not found."))
+        }
+    }
+
     func testMalformedSuccessBodyMapsToDecoding() async throws {
         URLProtocolStubRegistry.shared.setHandler { _ in
             .json(200, #"{"unexpected":true}"#)

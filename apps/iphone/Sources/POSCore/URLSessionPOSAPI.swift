@@ -14,7 +14,7 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
 
     public func health() async throws -> HealthResponse {
         let request = try makeRequest(method: "GET", path: "v2/health", timeout: Self.regularTimeout)
-        let response = try decode(HealthResponse.self, from: await send(request))
+        let response = try decode(HealthResponse.self, from: await send(request, isHealthCheck: true))
         guard response.ok, response.protocolVersion == 2 else {
             throw POSAPIError.decoding("服务器未提供 v2 协议")
         }
@@ -118,11 +118,16 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
         return request
     }
 
-    private func send(_ request: URLRequest) async throws -> Data {
+    private func send(_ request: URLRequest, isHealthCheck: Bool = false) async throws -> Data {
         do {
             let (data, response) = try await urlSession.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw POSAPIError.transport("响应不是 HTTP") }
             guard (200..<300).contains(http.statusCode) else {
+                // v2 health 必须公开可读；旧网关在鉴权前拦截未知路由，不能误报为密钥错误。
+                if isHealthCheck, [401, 403, 404].contains(http.statusCode) {
+                    throw POSAPIError.server(status: http.statusCode, code: "v2_unavailable",
+                        message: "当前地址未提供可用的 v2 服务。请更新云端服务并检查 /v2/* 转发，或填写 v2 服务器地址后重新配对。")
+                }
                 throw Self.httpError(status: http.statusCode, data: data)
             }
             return data

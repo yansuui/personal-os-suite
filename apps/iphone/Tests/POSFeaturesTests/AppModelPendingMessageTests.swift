@@ -92,19 +92,149 @@ final class AppModelPendingMessageTests: XCTestCase {
     }
 
     @MainActor
-    private func makeModel(api: PendingMessageAPI, pending: [PendingMessage] = []) async throws -> (AppModel, PendingSnapshotStore) {
-        let conversation = try PendingValues.conversation()
-        let snapshot = CachedSnapshot(savedAt: "2026-01-01T00:00:00Z", conversations: [conversation],
-            selectedConversationID: conversation.id,
-            conversationStates: [ConversationSnapshot(conversationID: conversation.id, messages: [], cursor: 0)],
-            pendingMessages: pending)
-        // 真正经过 Codable 往返，模拟重启后从磁盘读取的值。
-        let restored = try JSONDecoder().decode(CachedSnapshot.self, from: JSONEncoder().encode(snapshot))
-        let store = PendingSnapshotStore(snapshot: restored)
+    func testRestoredSessionRejectsIncompatibleHealthBeforeAuthenticatedRequests() async throws {
+        for status in [401, 403, 404] {
+            let api = try PendingMessageAPI(healthFailure: .server(status: status, code: "v2_unavailable", message: PendingValues.incompatibleDetail))
+            let credentials = PendingCredentialStore(session: try PendingValues.session())
+            let (model, store) = try await makeModel(api: api, pending: [PendingValues.pending], cachedMessages: [PendingValues.cachedMessage], credentials: credentials, expectsReady: false)
+            defer { model.signOut() }
+            XCTAssertEqual(model.phase.failureMessage, PendingValues.incompatibleDetail)
+            XCTAssertEqual(model.notice, PendingValues.incompatibleDetail)
+            XCTAssertEqual(model.connection.offlineReason, PendingValues.incompatibleDetail)
+            let calls = await api.recordedCalls()
+            XCTAssertEqual(calls, ["health"], "health失败不得请求me、会话、消息或pair")
+            try assertRestoredStatePreserved(model, store: store, credentials: credentials)
+        }
+    }
+
+    @MainActor
+    func testRestoredSessionKeepsReadyAndOfflineCacheOnHealthTransportFailure() async throws {
+        let api = try PendingMessageAPI(healthFailure: .transport("connection refused"))
+        let credentials = PendingCredentialStore(session: try PendingValues.session())
+        let (model, store) = try await makeModel(api: api, pending: [PendingValues.pending], cachedMessages: [PendingValues.cachedMessage], credentials: credentials)
+        defer { model.signOut() }
+        XCTAssertNil(model.phase.failureMessage)
+        XCTAssertEqual(model.connection.offlineReason, "网络不可达：connection refused")
+        XCTAssertEqual(model.notice, "网络不可达：connection refused")
+        let calls = await api.recordedCalls()
+        XCTAssertEqual(calls, ["health"], "网络恢复后需先重连验证协议，不能跳过health轮询")
+        try assertRestoredStatePreserved(model, store: store, credentials: credentials)
+    }
+
+    @MainActor
+    func testRestoredSessionRequiresPairingWhenCompatibleServerRejectsOldToken() async throws {
+        let api = try PendingMessageAPI(meFailure: .unauthorized)
+        let credentials = PendingCredentialStore(session: try PendingValues.session())
+        let (model, store) = try await makeModel(api: api, pending: [PendingValues.pending], cachedMessages: [PendingValues.cachedMessage], credentials: credentials, expectsReady: false)
+        defer { model.signOut() }
+        XCTAssertEqual(model.phase.failureMessage, "登录已失效，请重新配对")
+        XCTAssertEqual(model.connection.offlineReason, "登录已失效，请重新配对")
+        let calls = await api.recordedCalls()
+        XCTAssertEqual(calls, ["health", "me"], "协议通过后才验证token，失效后不可同步消息")
+        try assertRestoredStatePreserved(model, store: store, credentials: credentials)
+    }
+
+    @MainActor
+    func testPairHealthFailureCannotRestoreAnIncompatibleSessionOrBlameSecret() async throws {
+        let api = try PendingMessageAPI(healthFailure: .server(status: 404, code: "v2_unavailable", message: PendingValues.incompatibleDetail))
+        let credentials = PendingCredentialStore(session: try PendingValues.session())
+        let (model, store) = try await makeModel(api: api, pending: [PendingValues.pending], cachedMessages: [PendingValues.cachedMessage], credentials: credentials, expectsReady: false)
+        defer { model.signOut() }
+        let failures: [POSAPIError] = [
+            .server(status: 401, code: "v2_unavailable", message: PendingValues.incompatibleDetail),
+            .server(status: 403, code: "v2_unavailable", message: PendingValues.incompatibleDetail),
+            .server(status: 404, code: "v2_unavailable", message: PendingValues.incompatibleDetail),
+            .transport("connection refused")
+        ]
+        for (index, failure) in failures.enumerated() {
+            await api.setHealthFailure(failure)
+            await model.pair(serverURL: URL(string: "https://stub.invalid")!, secret: String(repeating: "x", count: 8), deviceName: "iPhone")
+            let expected: String
+            if case .transport = failure { expected = "连不上服务器：connection refused。请确认地址、端口和局域网可达" }
+            else { expected = PendingValues.incompatibleDetail }
+            XCTAssertFalse(model.phase.isReady, "failed旧会话虽保留凭据，也不能恢复ready")
+            XCTAssertEqual(model.phase.failureMessage, expected)
+            XCTAssertFalse(model.phase.failureMessage?.contains("配对密钥错误") ?? true)
+            let calls = await api.recordedCalls()
+            XCTAssertEqual(calls, Array(repeating: "health", count: index + 2), "health未通过不可发pair/me/messages")
+            try assertRestoredStatePreserved(model, store: store, credentials: credentials)
+        }
+    }
+
+    @MainActor
+    func testStartupActionsCannotBypassSuspendedHealthAndPendingSendIsPreserved() async throws {
+        let api = try PendingMessageAPI()
+        await api.holdHealth()
+        let unexpected = expectation(description: "health通过前不能发业务请求")
+        unexpected.isInverted = true
+        await api.observeBusinessRequests { unexpected.fulfill() }
+        let first = try PendingValues.conversation()
+        let second = try JSONDecoder().decode(Conversation.self, from: Data(#"{"id":"conversation-2","ownerId":"default","title":"另一会话","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}"#.utf8))
+        let snapshot = CachedSnapshot(savedAt: "2026-01-01T00:00:00Z", conversations: [first, second],
+            selectedConversationID: first.id,
+            conversationStates: [ConversationSnapshot(conversationID: first.id, messages: [], cursor: 0),
+                                 ConversationSnapshot(conversationID: second.id, messages: [], cursor: 0)])
+        let store = PendingSnapshotStore(snapshot: snapshot)
         let model = AppModel(serverURL: URL(string: "https://stub.invalid")!, api: api,
             credentials: PendingCredentialStore(session: try PendingValues.session()), store: store)
-        await model.bootstrap()
+        defer { model.signOut() }
+        let boot = Task { await model.bootstrap() }
+        await api.waitForHealthRequested()
+        XCTAssertTrue(model.isRefreshing)
+        await model.reconnect()
+        model.selectConversation(second.id)
+        await model.createConversation()
+        await model.send("检查期间的消息")
+        await fulfillment(of: [unexpected], timeout: 0.2)
+        let callsBeforeHealth = await api.recordedCalls()
+        XCTAssertEqual(callsBeforeHealth, ["health"])
+        let suspended = await api.healthIsSuspended()
+        XCTAssertTrue(suspended, "负断言期间health必须仍然挂起")
+        XCTAssertEqual(model.pendingMessages.count, 1)
+        XCTAssertEqual(model.pendingMessages.first?.text, "检查期间的消息")
+        XCTAssertEqual(model.pendingMessages.first?.conversationID, second.id)
+        XCTAssertEqual(try store.loadSnapshot()?.pendingMessages, model.pendingMessages)
+        XCTAssertEqual(model.notice, "服务器连接尚未验证，消息已保留待发")
+        await api.observeBusinessRequests(nil)
+        await api.releaseHealth()
+        await boot.value
         XCTAssertTrue(model.phase.isReady)
+        XCTAssertTrue(model.connection.isOnline)
+        XCTAssertEqual(model.selectedConversationID, second.id)
+        XCTAssertEqual(model.pendingMessages.count, 1, "检查通过也不能隐式重发用户的待发消息")
+        let sends = await api.recordedSends()
+        XCTAssertTrue(sends.isEmpty)
+    }
+
+    @MainActor
+    private func assertRestoredStatePreserved(_ model: AppModel, store: PendingSnapshotStore, credentials: PendingCredentialStore,
+                                             file: StaticString = #filePath, line: UInt = #line) throws {
+        let snapshot = store.initialSnapshot
+        XCTAssertEqual(model.pendingMessages, snapshot.pendingMessages, file: file, line: line)
+        XCTAssertEqual(model.messages, snapshot.conversationStates.first?.messages ?? [], file: file, line: line)
+        XCTAssertEqual(model.conversations, snapshot.conversations, file: file, line: line)
+        XCTAssertEqual(model.selectedConversationID, snapshot.selectedConversationID, file: file, line: line)
+        XCTAssertEqual(try store.loadSnapshot(), snapshot, "失败不得改写本地快照", file: file, line: line)
+        let session = try PendingValues.session()
+        XCTAssertEqual(model.session, session, file: file, line: line)
+        XCTAssertEqual(try credentials.load(), session, file: file, line: line)
+        XCTAssertEqual(credentials.recordedMutationCount(), 0, "失败不得删除或替换凭据", file: file, line: line)
+    }
+
+    @MainActor
+    private func makeModel(api: PendingMessageAPI, pending: [PendingMessage] = [], cachedMessages: [ChatMessage] = [],
+                           credentials: PendingCredentialStore? = nil, expectsReady: Bool = true) async throws -> (AppModel, PendingSnapshotStore) {
+        let conversation = try PendingValues.conversation()
+        let snapshot = CachedSnapshot(savedAt: "2026-01-01T00:00:00Z", conversations: [conversation], selectedConversationID: conversation.id,
+            conversationStates: [ConversationSnapshot(conversationID: conversation.id, messages: cachedMessages, cursor: cachedMessages.last?.seq ?? 0)], pendingMessages: pending)
+        let restored = try JSONDecoder().decode(CachedSnapshot.self, from: JSONEncoder().encode(snapshot))
+        let store = PendingSnapshotStore(snapshot: restored)
+        let credentialStore: PendingCredentialStore
+        if let credentials { credentialStore = credentials }
+        else { credentialStore = PendingCredentialStore(session: try PendingValues.session()) }
+        let model = AppModel(serverURL: URL(string: "https://stub.invalid")!, api: api, credentials: credentialStore, store: store)
+        await model.bootstrap()
+        XCTAssertEqual(model.phase.isReady, expectsReady)
         XCTAssertEqual(model.selectedConversationID, conversation.id)
         return (model, store)
     }
@@ -112,29 +242,29 @@ final class AppModelPendingMessageTests: XCTestCase {
 
 private enum PendingValues {
     static let conversationID = "conversation-1"
-
+    static let incompatibleDetail = "当前地址未提供可用的 v2 服务。请更新云端服务并检查 /v2/* 转发，或填写 v2 服务器地址后重新配对。"
+    static var pending: PendingMessage {
+        PendingMessage(conversationID: conversationID, clientRequestID: "cached-pending", text: "保留待发", createdAt: "2026-01-01T00:00:00Z")
+    }
+    static var cachedMessage: ChatMessage {
+        ChatMessage(id: "cached-message", conversationID: conversationID, clientRequestID: nil, seq: 7, role: "assistant", text: "离线缓存", createdAt: "2026-01-01T00:00:00Z")
+    }
     static func session() throws -> AuthSession {
         try JSONDecoder().decode(AuthSession.self, from: Data(#"{"token":"test-token","device":{"id":"test-device","name":"iPhone","role":"client","createdAt":"2026-01-01T00:00:00Z"}}"#.utf8))
     }
-
     static func conversation() throws -> Conversation {
         try JSONDecoder().decode(Conversation.self, from: Data(#"{"id":"conversation-1","ownerId":"default","title":"聊天","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}"#.utf8))
     }
-
     static func page(messages: [ChatMessage], after: Int) throws -> MessagePage {
         struct WirePage: Encodable { let messages: [ChatMessage]; let nextCursor: Int }
-        let page = WirePage(messages: messages, nextCursor: messages.last?.seq ?? after)
-        return try JSONDecoder().decode(MessagePage.self, from: JSONEncoder().encode(page))
+        return try JSONDecoder().decode(MessagePage.self, from: JSONEncoder().encode(WirePage(messages: messages, nextCursor: messages.last?.seq ?? after)))
     }
-
     static func ack(conversationID: String, request: SendMessageRequest, seq: Int) throws -> SendMessageAck {
         let messageID = "message-\(request.clientRequestID)"
         let body: [String: Any] = [
             "message": ["id": messageID, "conversationId": conversationID, "clientRequestId": request.clientRequestID,
                         "seq": seq, "role": "user", "text": request.text, "createdAt": "2026-01-01T00:00:00Z"],
-            "run": ["id": "run-\(request.clientRequestID)", "conversationId": conversationID,
-                    "messageId": messageID, "status": "queued"],
-            "created": true
+            "run": ["id": "run-\(request.clientRequestID)", "conversationId": conversationID, "messageId": messageID, "status": "queued"], "created": true
         ]
         return try JSONDecoder().decode(SendMessageAck.self, from: JSONSerialization.data(withJSONObject: body))
     }
@@ -149,27 +279,71 @@ private actor PendingMessageAPI: POSAPI {
     private let session: AuthSession
     private let conversation: Conversation
     private var sendFailures: [POSAPIError]
+    private var healthFailure: POSAPIError?
+    private let meFailure: POSAPIError?
     private var sends: [RecordedPendingSend] = []
+    private var calls: [String] = []
     private var messagesToRead: [ChatMessage] = []
+    private var shouldHoldHealth = false
+    private var healthGate: CheckedContinuation<Void, Never>?
+    private var healthWaiters: [CheckedContinuation<Void, Never>] = []
+    private var businessObserver: (@Sendable () -> Void)?
 
-    init(sendFailures: [POSAPIError] = []) throws {
+    init(sendFailures: [POSAPIError] = [], healthFailure: POSAPIError? = nil, meFailure: POSAPIError? = nil) throws {
         session = try PendingValues.session()
         conversation = try PendingValues.conversation()
         self.sendFailures = sendFailures
+        self.healthFailure = healthFailure
+        self.meFailure = meFailure
     }
-
     func recordedSends() -> [RecordedPendingSend] { sends }
+    func recordedCalls() -> [String] { calls }
     func setMessages(_ messages: [ChatMessage]) { messagesToRead = messages }
-    func health() async throws -> HealthResponse {
-        try JSONDecoder().decode(HealthResponse.self, from: Data(#"{"ok":true,"service":"personal-os-cloud","protocolVersion":2}"#.utf8))
+    func setHealthFailure(_ failure: POSAPIError) { healthFailure = failure }
+    func holdHealth() { shouldHoldHealth = true }
+    func healthIsSuspended() -> Bool { healthGate != nil }
+    func observeBusinessRequests(_ observer: (@Sendable () -> Void)?) { businessObserver = observer }
+    func waitForHealthRequested() async {
+        if calls.contains("health") { return }
+        await withCheckedContinuation { healthWaiters.append($0) }
     }
-    func pair(secret: String, _ request: PairRequest) async throws -> AuthSession { session }
-    func me(_ session: AuthSession) async throws -> DeviceInfo { self.session.device }
-    func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation { conversation }
-    func conversations(_ session: AuthSession) async throws -> [Conversation] { [conversation] }
+    func releaseHealth() {
+        shouldHoldHealth = false
+        healthGate?.resume()
+        healthGate = nil
+    }
+    private func record(_ call: String) {
+        calls.append(call)
+        if call != "health" { businessObserver?() }
+    }
+    func health() async throws -> HealthResponse {
+        record("health")
+        for waiter in healthWaiters { waiter.resume() }
+        healthWaiters.removeAll()
+        if shouldHoldHealth { await withCheckedContinuation { healthGate = $0 } }
+        if let healthFailure { throw healthFailure }
+        return try JSONDecoder().decode(HealthResponse.self, from: Data(#"{"ok":true,"service":"personal-os-cloud","protocolVersion":2}"#.utf8))
+    }
+    func pair(secret: String, _ request: PairRequest) async throws -> AuthSession {
+        record("pair")
+        return session
+    }
+    func me(_ session: AuthSession) async throws -> DeviceInfo {
+        record("me")
+        if let meFailure { throw meFailure }
+        return self.session.device
+    }
+    func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation {
+        record("createConversation")
+        return conversation
+    }
+    func conversations(_ session: AuthSession) async throws -> [Conversation] {
+        record("conversations")
+        return [conversation]
+    }
     func messages(_ session: AuthSession, conversationID: String, after: Int, waitSeconds: Int) async throws -> MessagePage {
+        record(waitSeconds > 0 ? "poll" : "messages")
         if waitSeconds > 0 {
-            // 后台长轮询保持挂起；signOut 会取消它。断言使用明确的 refresh，不依赖调度时机。
             try await Task.sleep(nanoseconds: 60_000_000_000)
             throw CancellationError()
         }
@@ -177,24 +351,50 @@ private actor PendingMessageAPI: POSAPI {
         return try PendingValues.page(messages: incoming, after: after)
     }
     func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck {
+        record("sendMessage")
         sends.append(RecordedPendingSend(conversationID: conversationID, request: request))
         if !sendFailures.isEmpty { throw sendFailures.removeFirst() }
         return try PendingValues.ack(conversationID: conversationID, request: request, seq: sends.count)
     }
 }
 
-private struct PendingCredentialStore: CredentialStore {
-    let session: AuthSession
-    func load() throws -> AuthSession? { session }
-    func save(_ session: AuthSession) throws {}
-    func clear() throws {}
+private final class PendingCredentialStore: CredentialStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: AuthSession?
+    private var mutationCount = 0
+    init(session: AuthSession) { self.session = session }
+    func load() throws -> AuthSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        return session
+    }
+    func save(_ session: AuthSession) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        self.session = session
+        mutationCount += 1
+    }
+    func clear() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        session = nil
+        mutationCount += 1
+    }
+    func recordedMutationCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return mutationCount
+    }
 }
 
 private final class PendingSnapshotStore: SnapshotStore, @unchecked Sendable {
+    let initialSnapshot: CachedSnapshot
     private let lock = NSLock()
     private var snapshot: CachedSnapshot
-
-    init(snapshot: CachedSnapshot) { self.snapshot = snapshot }
+    init(snapshot: CachedSnapshot) {
+        self.snapshot = snapshot
+        self.initialSnapshot = snapshot
+    }
     func loadSnapshot() throws -> CachedSnapshot? {
         lock.lock()
         defer { lock.unlock() }

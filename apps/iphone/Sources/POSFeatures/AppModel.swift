@@ -42,6 +42,7 @@ public final class AppModel: ObservableObject {
     private var syncGeneration = 0
     private var identityGeneration = 0
     private var hasBootstrapped = false
+    private var hasValidatedServer = false
     private static let serverURLDefaultsKey = "pos.serverURL"
 
     public init(serverURL: URL, api: POSAPI? = nil,
@@ -75,8 +76,8 @@ public final class AppModel: ObservableObject {
             if api == nil { api = apiFactory?(serverURL) }
             hydrateFromSnapshot()
             phase = .ready
-            startSync()
             await refresh()
+            if phase.isReady { startSync() }
         } catch {
             notice = "读取本机配对凭据失败，请重新配对"
         }
@@ -93,6 +94,7 @@ public final class AppModel: ObservableObject {
             phase = .failed("缺少网络实现"); return
         }
         guard !phase.isPairing else { return }
+        let canRestoreSession = phase.isReady && session != nil
         identityGeneration += 1
         let generation = identityGeneration
         stopSync()
@@ -118,12 +120,12 @@ public final class AppModel: ObservableObject {
             UserDefaults.standard.set(serverURL.absoluteString, forKey: Self.serverURLDefaultsKey)
             hydrateFromSnapshot()
             phase = .ready
-            startSync()
             await refresh()
+            if phase.isReady { startSync() }
         } catch {
             guard generation == identityGeneration else { return }
             let detail = POSCoreBridge.pairFailureMessage(error: error)
-            if session != nil {
+            if canRestoreSession {
                 phase = .ready
                 notice = detail
                 startSync()
@@ -149,6 +151,7 @@ public final class AppModel: ObservableObject {
     }
 
     private func resetChat() {
+        hasValidatedServer = false
         messages = []
         conversations = []
         selectedConversationID = nil
@@ -171,6 +174,9 @@ public final class AppModel: ObservableObject {
         isRefreshing = true
         defer { if generation == identityGeneration { isRefreshing = false } }
         do {
+            _ = try await api.health()
+            guard generation == identityGeneration else { return }
+            hasValidatedServer = true
             let device = try await api.me(session)
             guard device.role == "client" else { throw POSAPIError.unauthorized }
             let list = try await api.conversations(session)
@@ -205,6 +211,7 @@ public final class AppModel: ObservableObject {
 
     public func createConversation(title: String? = nil) async {
         guard phase.isReady, !isCreatingConversation, let api, let session else { return }
+        guard hasValidatedServer else { notice = "请先连接到兼容的服务器后创建会话"; return }
         let generation = identityGeneration
         isCreatingConversation = true
         defer { if generation == identityGeneration { isCreatingConversation = false } }
@@ -234,10 +241,11 @@ public final class AppModel: ObservableObject {
     }
 
     public func reconnect() async {
-        guard phase.isReady else { return }
+        guard phase.isReady, !isRefreshing else { return }
         connection = .unknown
-        startSync()
+        stopSync()
         await refresh()
+        if phase.isReady { startSync() }
     }
 
     /// 先保存待发消息，再提交。失败不生成新键，重启后仍可明确重试。
@@ -264,6 +272,7 @@ public final class AppModel: ObservableObject {
 
     private func sendPending(_ pending: PendingMessage) async {
         guard phase.isReady, !isSending, let api, let session else { return }
+        guard hasValidatedServer else { notice = "服务器连接尚未验证，消息已保留待发"; return }
         let generation = identityGeneration
         isSending = true
         defer { if generation == identityGeneration { isSending = false } }
@@ -310,8 +319,13 @@ public final class AppModel: ObservableObject {
         notice = POSCoreBridge.message(for: failure)
         switch failure {
         case .unauthorized:
+            hasValidatedServer = false
             stopSync()
             phase = .failed("登录已失效，请重新配对")
+        case .server(_, "v2_unavailable", let detail):
+            hasValidatedServer = false
+            stopSync()
+            phase = .failed(detail)
         case .conflict:
             needsRefresh = true
         default: break
@@ -320,7 +334,7 @@ public final class AppModel: ObservableObject {
 
     private func startSync() {
         stopSync()
-        guard phase.isReady, let api, let session, let id = selectedConversationID else { return }
+        guard phase.isReady, hasValidatedServer, let api, let session, let id = selectedConversationID else { return }
         let generation = syncGeneration
         let engine = SyncEngine(api: api, session: session, conversationID: id, store: snapshotStore(), waitSeconds: 20)
         syncEngine = engine

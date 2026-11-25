@@ -108,6 +108,7 @@ enum POSCoreBridge {
         case .conflict(let detail):
             return "服务端数据已更新（\(detail)）"
         case .server(let status, let code, let message):
+            if code == "v2_unavailable" { return message }
             if message.isEmpty {
                 return "服务器返回 \(status)\(code.isEmpty ? "" : "（\(code)）")"
             }
@@ -128,6 +129,8 @@ enum POSCoreBridge {
             return "配对密钥错误，请检查云端管理员提供的密钥后重试"
         case .transport(let detail):
             return "连不上服务器：\(detail)。请确认地址、端口和局域网可达"
+        case .server(_, "v2_unavailable", let detail):
+            return detail
         case .server(let status, let code, let message) where status == 401 || status == 403:
             let detail = message.isEmpty ? "" : "：\(message)"
             return "配对密钥错误（\(status)\(code.isEmpty ? "" : " \(code)")）\(detail)"
