@@ -66,7 +66,7 @@ struct PairingView: View {
             Text(model.session == nil ? "连接你的 Personal OS" : "重新配对这台设备")
                 .font(.title2.weight(.bold))
                 .foregroundStyle(POSTheme.primaryText)
-            Text("手机作为 client 设备接入桌面端；配对成功后会自动开始同步。")
+            Text("手机作为 client 设备接入 v2 云端；配对成功后可创建会话并同步消息。")
                 .font(.subheadline)
                 .foregroundStyle(POSTheme.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -124,8 +124,8 @@ struct PairingView: View {
 
     private var hint: some View {
         VStack(alignment: .leading, spacing: POSTheme.Spacing.xs) {
-            Text("配对密钥由桌面端 Personal OS 提供，只在本机保存一次。")
-            Text("手机与桌面需要在同一网络，或桌面端已开放可访问的地址。")
+            Text("配对密钥由云端管理员提供，只用于本次配对；设备令牌保存到本机 Keychain。")
+            Text("请填写手机可以访问的 v2 云端地址。")
         }
         .font(.footnote)
         .foregroundStyle(POSTheme.secondaryText)

@@ -1,29 +1,18 @@
 import Foundation
 import POSCore
 
-/// POSCore 值的集中适配层。
-///
-/// 界面层只依赖 CONTRACT §3 的公开面；所有「构造 POSCore 值」的代码都收在这里，
-/// 这样一旦 POSCore 的实际签名与契约有出入，只需改本文件。
-///
-/// CONTRACT-GAP（需要 B 侧确认）：
-/// CONTRACT §3 的 `PairRequest` / `SendMessageRequest` / `ChatMessage` / `CachedSnapshot`
-/// 只声明了 `public var` / `public let` 属性，没有列出 `public init`。Swift 里公开结构体的
-/// 隐式成员初始化器是 internal，跨模块不可调用。界面层必须能构造这四种值
-/// （配对请求、发消息请求、乐观插入的本地消息、持久化快照），因此这里按属性声明顺序
-/// 使用成员初始化器，并假定 POSCore 会补 `public init(...)`（签名逐字对应 §3 的属性列表）。
-/// 若 B 侧没有补，编译会只在本文件报错，页面代码无需改动。
+/// POSCore 值的格式化、稳定身份摘要和错误文案适配。
 enum POSCoreBridge {
 
     // MARK: - 请求构造
 
     /// 手机固定 role=client、kind=nil；能力位留空（服务端要求 kebab-case 且 ≤8 项）。
     static func pairRequest(name: String, role: String) -> PairRequest {
-        PairRequest(name: name, role: role, kind: nil, capabilities: [])
+        PairRequest(name: name, role: role)
     }
 
     static func sendRequest(clientRequestID: String, text: String) -> SendMessageRequest {
-        SendMessageRequest(clientRequestID: clientRequestID, text: text, conversationID: nil)
+        SendMessageRequest(clientRequestID: clientRequestID, text: text)
     }
 
     // MARK: - 消息
@@ -136,7 +125,7 @@ enum POSCoreBridge {
         let failure = apiError(from: error)
         switch failure {
         case .unauthorized:
-            return "配对密钥错误，请检查桌面端显示的密钥后重试"
+            return "配对密钥错误，请检查云端管理员提供的密钥后重试"
         case .transport(let detail):
             return "连不上服务器：\(detail)。请确认地址、端口和局域网可达"
         case .server(let status, let code, let message) where status == 401 || status == 403:

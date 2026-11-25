@@ -40,7 +40,7 @@ final class ErrorMappingTests: XCTestCase {
         }
 
         do {
-            _ = try await api.tasks(session)
+            _ = try await api.me(session)
             XCTFail("403 应抛错")
         } catch let error as POSAPIError {
             XCTAssertEqual(error, .unauthorized)
@@ -54,7 +54,7 @@ final class ErrorMappingTests: XCTestCase {
 
         let request = try Fixtures.sendMessageRequest(clientRequestID: "req-9", text: "hello")
         do {
-            _ = try await api.sendMessage(session, request)
+            _ = try await api.sendMessage(session, conversationID: Fixtures.conversationID, request)
             XCTFail("409 应抛错")
         } catch let error as POSAPIError {
             XCTAssertEqual(error, .conflict("requestId 已被其它正文占用"))
@@ -70,7 +70,7 @@ final class ErrorMappingTests: XCTestCase {
         }
 
         do {
-            _ = try await api.presence(session)
+            _ = try await api.me(session)
             XCTFail("500 应抛错")
         } catch let error as POSAPIError {
             XCTAssertEqual(error, .server(status: 500, code: "internal", message: "internal error"))
@@ -83,7 +83,7 @@ final class ErrorMappingTests: XCTestCase {
         }
 
         do {
-            _ = try await api.tasks(session)
+            _ = try await api.me(session)
             XCTFail("502 应抛错")
         } catch let error as POSAPIError {
             guard case let .server(status, code, message) = error else {

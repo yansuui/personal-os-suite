@@ -139,12 +139,29 @@ targets:
         # CONTRACT-GAP: CONTRACT 未说明 POSCoreTests 是否带 TEST_HOST；测试只依赖
         # POSCore（不依赖 POSApp），这里配成无宿主的逻辑测试包（不设 TEST_HOST）。
 
+  POSFeaturesTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests/POSFeaturesTests
+    dependencies:
+      - target: POSCore
+        embed: true
+      - target: POSFeatures
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BUNDLE_ID).featuretests"
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   POSApp:
     build:
       targets:
         POSApp: all
         POSCoreTests: [test]
+        POSFeaturesTests: [test]
     run:
       config: Debug
     test:
@@ -154,6 +171,7 @@ schemes:
         - POSCore
       targets:
         - name: POSCoreTests
+        - name: POSFeaturesTests
     profile:
       config: Release
     analyze:

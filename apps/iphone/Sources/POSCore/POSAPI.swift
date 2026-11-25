@@ -1,17 +1,12 @@
 import Foundation
 
-/// POSCore 对服务端的全部读取/写入能力。
-///
-/// CONTRACT §3 公开面，签名不可改。实现见 `URLSessionPOSAPI`；
-/// 测试与预览可以注入自己的实现（例如 URLProtocol 桩）。
+/// 冻结 v2 最小聊天接口；任务、审批、上下文和 presence 不属于本轮协议。
 public protocol POSAPI: Sendable {
+    func health() async throws -> HealthResponse
     func pair(secret: String, _ request: PairRequest) async throws -> AuthSession
     func me(_ session: AuthSession) async throws -> DeviceInfo
-    func timeline(_ session: AuthSession, after: Int, waitSeconds: Int) async throws -> TimelinePage
-    func sendMessage(_ session: AuthSession, _ request: SendMessageRequest) async throws -> SendMessageAck
-    func tasks(_ session: AuthSession) async throws -> TaskList
-    func approve(_ session: AuthSession, taskID: String, approved: Bool, note: String?) async throws
-    func submitVerdict(_ session: AuthSession, taskID: String, verdict: String, note: String?) async throws
-    func context(_ session: AuthSession) async throws -> ContextSnapshot
-    func presence(_ session: AuthSession) async throws -> Presence
+    func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation
+    func conversations(_ session: AuthSession) async throws -> [Conversation]
+    func messages(_ session: AuthSession, conversationID: String, after: Int, waitSeconds: Int) async throws -> MessagePage
+    func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck
 }

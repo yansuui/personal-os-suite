@@ -1,80 +1,49 @@
 import XCTest
 import POSCore
 
-/// 幂等：同一个 SendMessageRequest 重试两次，必须发出完全相同的请求体（clientRequestId 不变）。
 final class SendMessageTests: XCTestCase {
-    private var api: URLSessionPOSAPI!
-    private var session: AuthSession!
+    override func setUp() { super.setUp(); URLProtocolStubRegistry.shared.reset() }
+    override func tearDown() { URLProtocolStubRegistry.shared.reset(); super.tearDown() }
 
-    override func setUp() {
-        super.setUp()
-        URLProtocolStubRegistry.shared.reset()
-        api = makeStubAPI(baseURL: Fixtures.baseURL)
-        session = try? Fixtures.session()
-    }
-
-    override func tearDown() {
-        URLProtocolStubRegistry.shared.reset()
-        api = nil
-        session = nil
-        super.tearDown()
-    }
-
-    func testSendMessageRetryReusesClientRequestID() async throws {
+    func testNewAndReplayShareMessageRunAndIdempotencyKey() async throws {
+        var call = 0
         URLProtocolStubRegistry.shared.setHandler { _ in
-            .json(201, #"{"message":{"id":"msg-1","seq":7},"duplicate":false}"#)
+            call += 1
+            return .json(call == 1 ? 201 : 200, Fixtures.sendAck(created: call == 1))
         }
-
-        let request = try Fixtures.sendMessageRequest(clientRequestID: "req-1", text: "hello")
-
-        let first = try await api.sendMessage(session, request)
-        let second = try await api.sendMessage(session, request)
-
-        XCTAssertEqual(first.messageID, "msg-1")
-        XCTAssertNil(first.runID)
-        XCTAssertEqual(second.messageID, "msg-1")
-
-        let recorded = URLProtocolStubRegistry.shared.requests
-        XCTAssertEqual(recorded.count, 2)
-        XCTAssertEqual(recorded[0].stubPath, "/v1/chat/messages")
-        XCTAssertEqual(recorded[0].httpMethod, "POST")
-
-        let firstBody = try XCTUnwrap(recorded[0].stubBody)
-        let secondBody = try XCTUnwrap(recorded[1].stubBody)
-        XCTAssertEqual(firstBody, secondBody, "重试必须复用同一 clientRequestID，请求体逐字节一致")
-
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: firstBody) as? [String: Any])
-        XCTAssertEqual(json["clientRequestId"] as? String, "req-1")
-        XCTAssertEqual(json["text"] as? String, "hello")
-        // conversationID 为 nil 时不下发该键。
-        XCTAssertNil(json["conversationId"])
+        let api = makeStubAPI()
+        let session = try Fixtures.session()
+        let pending = PendingMessage(conversationID: Fixtures.conversationID, clientRequestID: "req-1",
+                                     text: "hello", createdAt: "2026-01-01T00:00:00.000Z")
+        // 模拟重启：从持久化的请求恢复，而不是重新生成 UUID。
+        let restored = try JSONDecoder().decode(PendingMessage.self, from: JSONEncoder().encode(pending))
+        let first = try await api.sendMessage(session, conversationID: pending.conversationID, pending.request)
+        let replay = try await api.sendMessage(session, conversationID: restored.conversationID, restored.request)
+        XCTAssertTrue(first.created)
+        XCTAssertFalse(replay.created)
+        XCTAssertEqual(first.message, replay.message)
+        XCTAssertEqual(first.run.id, replay.run.id)
+        XCTAssertEqual(first.run.status, "queued")
+        let requests = URLProtocolStubRegistry.shared.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].stubPath, "/v2/conversations/conv-1/messages")
+        XCTAssertEqual(requests[0].httpMethod, "POST")
+        let firstBody = try XCTUnwrap(requests[0].stubBody)
+        XCTAssertEqual(firstBody, requests[1].stubBody)
+        let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: firstBody) as? [String: String])
+        XCTAssertEqual(body, ["clientRequestId": "req-1", "text": "hello"])
     }
 
-    func testDuplicateAckStillCarriesMessageID() async throws {
-        // 服务端幂等重放返回 200 + duplicate: true，ack 语义不变。
+    func testAckWithoutRunFailsAsDecoding() async throws {
         URLProtocolStubRegistry.shared.setHandler { _ in
-            .json(200, #"{"message":{"id":"msg-1"},"duplicate":true}"#)
+            .json(201, "{\"message\":\(Fixtures.message()),\"created\":true}")
         }
-
-        let request = try Fixtures.sendMessageRequest()
-        let ack = try await api.sendMessage(session, request)
-
-        XCTAssertEqual(ack.messageID, "msg-1")
-    }
-
-    func testAckWithoutMessageBodyFailsAsDecoding() async throws {
-        URLProtocolStubRegistry.shared.setHandler { _ in
-            .json(201, #"{"duplicate":false}"#)
-        }
-
-        let request = try Fixtures.sendMessageRequest()
         do {
-            _ = try await api.sendMessage(session, request)
-            XCTFail("缺少 message 时应抛 .decoding")
+            _ = try await makeStubAPI().sendMessage(Fixtures.session(), conversationID: Fixtures.conversationID,
+                                                    Fixtures.sendMessageRequest())
+            XCTFail("不能伪造缺失的运行")
         } catch let error as POSAPIError {
-            guard case .decoding = error else {
-                return XCTFail("期望 .decoding，实际 \(error)")
-            }
+            guard case .decoding = error else { return XCTFail("应为解码错误") }
         }
     }
 }

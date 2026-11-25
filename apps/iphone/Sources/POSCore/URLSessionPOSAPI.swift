@@ -1,281 +1,168 @@
 import Foundation
 
-/// 基于 `URLSession` 的 POSAPI 实现。
-///
-/// 约定（CONTRACT §3 §6）：
-/// - 除 `/v1/pair`（用 `x-pair-secret`）外，所有请求带 `Authorization: Bearer <token>`；
-/// - 分档超时：普通请求 15s，`timeline` 长轮询 `max(30, waitSeconds + 10)`；
-/// - 错误映射：401/403 → `.unauthorized`，409 → `.conflict`，其它非 2xx → `.server`，
-///   解码失败 → `.decoding`，网络错误 → `.transport`；
-/// - 任何日志/错误描述都不得包含 token 正文（本实现不在任何地方打印请求或响应）。
+/// v2 HTTP 客户端。普通请求 15s；长轮询等待 0...25s，超时至少 wait+10/30s。
+/// 不记录请求、响应或凭据；409 向上抛，由界面刷新。
 public struct URLSessionPOSAPI: POSAPI, Sendable {
     private let config: ServerConfig
     private let urlSession: URLSession
-
-    /// 普通请求超时（秒）。
     private static let regularTimeout: TimeInterval = 15
-    /// 长轮询超时下限（秒）；实际值取 `max(30, waitSeconds + 10)`。
-    private static let longPollFloor: Int = 30
 
     public init(config: ServerConfig, session: URLSession = .shared) {
         self.config = config
         self.urlSession = session
     }
 
-    // MARK: - POSAPI
+    public func health() async throws -> HealthResponse {
+        let request = try makeRequest(method: "GET", path: "v2/health", timeout: Self.regularTimeout)
+        let response = try decode(HealthResponse.self, from: await send(request))
+        guard response.ok, response.protocolVersion == 2 else {
+            throw POSAPIError.decoding("服务器未提供 v2 协议")
+        }
+        return response
+    }
 
     public func pair(secret: String, _ request: PairRequest) async throws -> AuthSession {
-        let body = try encode(request)
         let urlRequest = try makeRequest(
-            method: "POST",
-            path: "v1/pair",
-            headers: [
-                "accept": "application/json",
-                "content-type": "application/json",
-                // 配对用独立密钥头，不带 Bearer。
-                "x-pair-secret": secret
-            ],
-            timeout: Self.regularTimeout,
-            body: body
+            method: "POST", path: "v2/pair", headers: ["x-pair-secret": secret],
+            timeout: Self.regularTimeout, body: encode(request)
         )
-        let data = try await send(urlRequest)
-        return try decode(AuthSession.self, from: data)
+        return try decode(AuthSession.self, from: await send(urlRequest))
     }
 
     public func me(_ session: AuthSession) async throws -> DeviceInfo {
-        let request = try authorizedRequest(method: "GET", path: "v1/me", session: session, timeout: Self.regularTimeout)
-        let data = try await send(request)
-        return try decode(DeviceEnvelope.self, from: data).device
+        let request = try authorizedRequest(method: "GET", path: "v2/me", session: session)
+        return try decode(DeviceEnvelope.self, from: await send(request)).device
     }
 
-    public func timeline(_ session: AuthSession, after: Int, waitSeconds: Int) async throws -> TimelinePage {
-        let wait = max(0, waitSeconds)
-        let timeout = TimeInterval(max(Self.longPollFloor, wait + 10))
-        let query = [
-            URLQueryItem(name: "after", value: String(max(0, after))),
-            URLQueryItem(name: "wait", value: String(wait))
-        ]
+    public func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation {
         let request = try authorizedRequest(
-            method: "GET",
-            path: "v1/timeline/events",
-            query: query,
-            session: session,
-            timeout: timeout
+            method: "POST", path: "v2/conversations", session: session,
+            body: encode(CreateConversationRequest(title: title))
         )
-        let data = try await send(request)
-        return try decode(TimelinePage.self, from: data)
+        return try decode(ConversationEnvelope.self, from: await send(request)).conversation
     }
 
-    public func sendMessage(_ session: AuthSession, _ request: SendMessageRequest) async throws -> SendMessageAck {
-        // 幂等键由调用方生成；这里原样编码，重试请求体逐字节一致。
-        let body = try encode(request)
-        let urlRequest = try authorizedRequest(
-            method: "POST",
-            path: "v1/chat/messages",
-            session: session,
-            timeout: Self.regularTimeout,
-            body: body
+    public func conversations(_ session: AuthSession) async throws -> [Conversation] {
+        let request = try authorizedRequest(method: "GET", path: "v2/conversations", session: session)
+        return try decode(ConversationsEnvelope.self, from: await send(request)).conversations
+    }
+
+    public func messages(_ session: AuthSession, conversationID: String, after: Int, waitSeconds: Int) async throws -> MessagePage {
+        let wait = min(25, max(0, waitSeconds))
+        let after = max(0, after)
+        let request = try authorizedRequest(
+            method: "GET", path: messagesPath(conversationID),
+            query: [URLQueryItem(name: "after", value: String(after)), URLQueryItem(name: "wait", value: String(wait))],
+            session: session, timeout: TimeInterval(max(30, wait + 10))
         )
-        let data = try await send(urlRequest)
-        let envelope = try decode(ChatCreateEnvelope.self, from: data)
-        return SendMessageAck(messageID: envelope.message.id, runID: nil)
-    }
-
-    public func tasks(_ session: AuthSession) async throws -> TaskList {
-        let request = try authorizedRequest(method: "GET", path: "v1/tasks", session: session, timeout: Self.regularTimeout)
-        let data = try await send(request)
-        return try decode(TaskList.self, from: data)
-    }
-
-    public func approve(_ session: AuthSession, taskID: String, approved: Bool, note: String?) async throws {
-        // v1 的 POST /v1/tasks/:id/approve 无条件批准（请求体只作说明，没有拒绝分支）。
-        // 若 approved == false 仍打 /approve，界面上的「拒绝」会静默变成「批准」，
-        // 因此在服务端补出 reject 端点前，拒绝一律映射为「取消该任务」。
-        // CONTRACT-DEVIATION: reject 语义借道 /cancel，等云端 ApprovalService 落地后替换。
-        guard approved else {
-            let cancel = try authorizedRequest(
-                method: "POST",
-                path: "v1/tasks/\(taskID)/cancel",
-                session: session,
-                timeout: Self.regularTimeout
-            )
-            _ = try await send(cancel)
-            return
+        let page = try decode(MessagePage.self, from: await send(request))
+        // 缺少会话信息或游标非法时不允许把错误页写入缓存。
+        guard page.messages.count <= 200,
+              page.messages.allSatisfy({ $0.conversationID == conversationID && $0.seq > after }),
+              page.messages.map(\.seq) == page.messages.map(\.seq).sorted(),
+              page.nextCursor == (page.messages.last?.seq ?? after) else {
+            throw POSAPIError.decoding("消息会话或增量游标无效")
         }
-        let body = try encode(ApproveRequest(approved: approved, note: note))
-        let request = try authorizedRequest(
-            method: "POST",
-            path: "v1/tasks/\(taskID)/approve",
-            session: session,
-            timeout: Self.regularTimeout,
-            body: body
+        return page
+    }
+
+    public func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck {
+        guard !request.clientRequestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw POSAPIError.decoding("消息缺少幂等键")
+        }
+        let urlRequest = try authorizedRequest(
+            method: "POST", path: messagesPath(conversationID), session: session, body: encode(request)
         )
-        _ = try await send(request)
+        let ack = try decode(SendMessageAck.self, from: await send(urlRequest))
+        guard ack.message.conversationID == conversationID,
+              ack.message.clientRequestID == request.clientRequestID,
+              ack.run.conversationId == conversationID, ack.run.messageId == ack.message.id else {
+            throw POSAPIError.decoding("发送确认与会话或幂等键不匹配")
+        }
+        return ack
     }
 
-    public func submitVerdict(_ session: AuthSession, taskID: String, verdict: String, note: String?) async throws {
-        let body = try encode(VerdictRequest(verdict: verdict, note: note))
-        let request = try authorizedRequest(
-            method: "POST",
-            path: "v1/tasks/\(taskID)/verdict",
-            session: session,
-            timeout: Self.regularTimeout,
-            body: body
-        )
-        _ = try await send(request)
+    private func messagesPath(_ conversationID: String) throws -> String {
+        guard conversationID.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else {
+            throw POSAPIError.decoding("会话 ID 无效")
+        }
+        return "v2/conversations/\(conversationID)/messages"
     }
 
-    public func context(_ session: AuthSession) async throws -> ContextSnapshot {
-        let request = try authorizedRequest(method: "GET", path: "v1/context", session: session, timeout: Self.regularTimeout)
-        let data = try await send(request)
-        return try decode(ContextSnapshot.self, from: data)
+    private func authorizedRequest(method: String, path: String, query: [URLQueryItem] = [],
+                                   session: AuthSession, timeout: TimeInterval = URLSessionPOSAPI.regularTimeout,
+                                   body: Data? = nil) throws -> URLRequest {
+        try makeRequest(method: method, path: path, query: query,
+                        headers: ["authorization": "Bearer \(session.token)"], timeout: timeout, body: body)
     }
 
-    public func presence(_ session: AuthSession) async throws -> Presence {
-        let request = try authorizedRequest(method: "GET", path: "v1/presence", session: session, timeout: Self.regularTimeout)
-        let data = try await send(request)
-        return try decode(Presence.self, from: data)
-    }
-
-    // MARK: - 请求构造
-
-    private func authorizedRequest(
-        method: String,
-        path: String,
-        query: [URLQueryItem] = [],
-        session: AuthSession,
-        timeout: TimeInterval,
-        body: Data? = nil
-    ) throws -> URLRequest {
-        var headers = ["accept": "application/json"]
-        if body != nil { headers["content-type"] = "application/json" }
-        // token 只出现在请求头；不写入日志、错误描述或 URL。
-        headers["authorization"] = "Bearer \(session.token)"
-        return try makeRequest(method: method, path: path, query: query, headers: headers, timeout: timeout, body: body)
-    }
-
-    private func makeRequest(
-        method: String,
-        path: String,
-        query: [URLQueryItem] = [],
-        headers: [String: String],
-        timeout: TimeInterval,
-        body: Data? = nil
-    ) throws -> URLRequest {
+    private func makeRequest(method: String, path: String, query: [URLQueryItem] = [],
+                             headers: [String: String] = [:], timeout: TimeInterval,
+                             body: Data? = nil) throws -> URLRequest {
         guard var components = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false) else {
             throw POSAPIError.transport("服务器地址无效")
         }
         var basePath = components.path
         if basePath.hasSuffix("/") { basePath.removeLast() }
-        let trimmedPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
-        components.path = basePath + "/" + trimmedPath
+        components.path = basePath + "/" + path
         components.queryItems = query.isEmpty ? nil : query
-        guard let url = components.url else {
-            throw POSAPIError.transport("服务器地址无效")
-        }
+        components.fragment = nil
+        guard let url = components.url else { throw POSAPIError.transport("服务器地址无效") }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
-        for (field, value) in headers {
-            request.setValue(value, forHTTPHeaderField: field)
-        }
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        if body != nil { request.setValue("application/json", forHTTPHeaderField: "content-type") }
+        for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
         request.httpBody = body
         return request
     }
 
-    // MARK: - 发送与解码
-
     private func send(_ request: URLRequest) async throws -> Data {
         do {
             let (data, response) = try await urlSession.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw POSAPIError.transport("响应不是 HTTP")
-            }
+            guard let http = response as? HTTPURLResponse else { throw POSAPIError.transport("响应不是 HTTP") }
             guard (200..<300).contains(http.statusCode) else {
                 throw Self.httpError(status: http.statusCode, data: data)
             }
             return data
         } catch let error as POSAPIError {
             throw error
-        } catch let error as URLError where error.code == .cancelled {
-            throw POSAPIError.transport("请求已取消")
         } catch {
-            // 只保留系统错误描述：URLError 文案不含请求头，不会泄露 token。
             throw POSAPIError.transport(error.localizedDescription)
         }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        do {
-            return try JSONDecoder().decode(type, from: data)
-        } catch {
-            throw POSAPIError.decoding("响应解析失败：\(error)")
-        }
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch { throw POSAPIError.decoding("响应解析失败") }
     }
 
     private func encode<T: Encodable>(_ value: T) throws -> Data {
         do {
-            return try JSONEncoder().encode(value)
-        } catch {
-            // 编码失败属于实现缺陷，复用 `.decoding`（错误文案不含 token）。
-            throw POSAPIError.decoding("请求编码失败：\(error)")
-        }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            return try encoder.encode(value)
+        } catch { throw POSAPIError.decoding("请求编码失败") }
     }
 
-    /// 非 2xx → POSAPIError。409 只上报冲突，绝不自动重试或合并（CONTRACT §3 行为 3）。
     private static func httpError(status: Int, data: Data) -> POSAPIError {
         let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: data)
-        let code = (envelope?.error?.code ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let message = (envelope?.error?.message ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = envelope?.error.code ?? "http-\(status)"
+        let message = envelope?.error.message ?? "请求失败（HTTP \(status)）"
         switch status {
-        case 401, 403:
-            return .unauthorized
-        case 409:
-            return .conflict(message.isEmpty ? "版本冲突，请刷新后重试" : message)
-        default:
-            return .server(
-                status: status,
-                code: code.isEmpty ? "http-\(status)" : code,
-                message: message.isEmpty ? "请求失败（HTTP \(status)）" : message
-            )
+        case 401, 403: return .unauthorized
+        case 409: return .conflict(message)
+        default: return .server(status: status, code: code, message: message)
         }
     }
 }
 
-// MARK: - 响应外壳
-
-/// `GET /v1/me` → `{ device }`。
-private struct DeviceEnvelope: Decodable {
-    let device: DeviceInfo
-}
-
-/// `POST /v1/chat/messages` → `{ message, duplicate }`；只取 message.id。
-private struct ChatCreateEnvelope: Decodable {
-    struct Message: Decodable {
-        let id: String
-    }
-
-    let message: Message
-}
-
-/// 服务端错误体 `{ error: { code, message } }`。
+private struct DeviceEnvelope: Decodable { let device: DeviceInfo }
+private struct ConversationEnvelope: Decodable { let conversation: Conversation }
+private struct ConversationsEnvelope: Decodable { let conversations: [Conversation] }
+private struct CreateConversationRequest: Encodable { let title: String? }
 private struct ErrorEnvelope: Decodable {
-    struct Payload: Decodable {
-        let code: String?
-        let message: String?
-    }
-
-    let error: Payload?
-}
-
-/// `POST /v1/tasks/:id/approve` 请求体（服务端当前不读取，仅作为说明性字段）。
-private struct ApproveRequest: Encodable {
-    let approved: Bool
-    let note: String?
-}
-
-/// `POST /v1/tasks/:id/verdict` 请求体，服务端读取 `verdict` 与可选 `note`。
-private struct VerdictRequest: Encodable {
-    let verdict: String
-    let note: String?
+    struct Payload: Decodable { let code: String; let message: String }
+    let error: Payload
 }

@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import POSCore
 
-/// 记忆：只读列表 + 本地搜索过滤。数据来自 `/v1/context` 的云端快照。
+/// 升级前的记忆视图，v2 未接入，主界面不提供入口。
 struct MemoryView: View {
     @ObservedObject var model: AppModel
     @State private var query: String = ""

@@ -1,75 +1,46 @@
 import XCTest
 import POSCore
 
-/// 时间线：eventCursor → seq、source → role、nextCursor 透传。
 final class TimelineCursorTests: XCTestCase {
-    private var api: URLSessionPOSAPI!
-    private var session: AuthSession!
+    override func setUp() { super.setUp(); URLProtocolStubRegistry.shared.reset() }
+    override func tearDown() { URLProtocolStubRegistry.shared.reset(); super.tearDown() }
 
-    override func setUp() {
-        super.setUp()
-        URLProtocolStubRegistry.shared.reset()
-        api = makeStubAPI(baseURL: Fixtures.baseURL)
-        session = try? Fixtures.session()
-    }
-
-    override func tearDown() {
-        URLProtocolStubRegistry.shared.reset()
-        api = nil
-        session = nil
-        super.tearDown()
-    }
-
-    func testTimelineDecodesEventsAndNextCursor() async throws {
+    func testMessagesDecodeUserAndAssistantWithSharedSequence() async throws {
         URLProtocolStubRegistry.shared.setHandler { _ in
-            .json(200, Fixtures.timelinePage(
-                events: [
-                    Fixtures.timelineEvent(messageID: "m1", eventCursor: 5, source: "phone", text: "hello"),
-                    Fixtures.timelineEvent(messageID: "m2", eventCursor: 9, source: "assistant", text: "hi")
-                ],
-                nextCursor: 6
-            ))
+            .json(200, Fixtures.messagePage(messages: [
+                Fixtures.message(messageID: "user-1", seq: 1),
+                Fixtures.message(messageID: "assistant-1", seq: 2, role: "assistant", clientRequestID: nil)
+            ], nextCursor: 2))
         }
+        let page = try await makeStubAPI().messages(Fixtures.session(), conversationID: Fixtures.conversationID,
+                                                    after: 0, waitSeconds: 20)
+        XCTAssertEqual(page.messages.map(\.role), ["user", "assistant"])
+        XCTAssertEqual(page.messages.map(\.seq), [1, 2])
+        XCTAssertEqual(page.messages[1].conversationID, "conv-1")
+        XCTAssertNil(page.messages[1].clientRequestID)
+        XCTAssertEqual(page.nextCursor, 2)
+    }
 
-        let page = try await api.timeline(session, after: 0, waitSeconds: 20)
-
-        XCTAssertEqual(page.events.count, 2)
-        XCTAssertEqual(page.events[0].id, "m1")
-        XCTAssertEqual(page.events[0].seq, 5)
-        XCTAssertEqual(page.events[0].role, "user")
-        XCTAssertEqual(page.events[1].id, "m2")
-        XCTAssertEqual(page.events[1].seq, 9)
-        XCTAssertEqual(page.events[1].role, "assistant")
+    func testEmptyPageKeepsRequestCursor() async throws {
+        URLProtocolStubRegistry.shared.setHandler { _ in .json(200, Fixtures.messagePage(nextCursor: 6)) }
+        let page = try await makeStubAPI().messages(Fixtures.session(), conversationID: Fixtures.conversationID,
+                                                    after: 6, waitSeconds: 20)
+        XCTAssertTrue(page.messages.isEmpty)
         XCTAssertEqual(page.nextCursor, 6)
-    }
-
-    func testEmptyTimelinePageHasNoNextCursor() async throws {
-        URLProtocolStubRegistry.shared.setHandler { _ in
-            .json(200, Fixtures.timelinePage(events: [], nextCursor: nil))
-        }
-
-        let page = try await api.timeline(session, after: 6, waitSeconds: 20)
-
-        XCTAssertTrue(page.events.isEmpty)
-        XCTAssertNil(page.nextCursor)
         let request = try XCTUnwrap(URLProtocolStubRegistry.shared.requests.first)
-        XCTAssertEqual(request.stubQueryValue("after"), "6", "空页请求沿用旧游标")
+        XCTAssertEqual(request.stubQueryValue("after"), "6")
     }
 
-    func testMessageDecodingAcceptsChatShape() async throws {
-        // 同一 ChatMessage 也接受 /v1/chat/messages 的字段（id/seq/role）。
-        let message = try Fixtures.decode(ChatMessage.self, from: """
-        {
-          "id": "msg-1",
-          "seq": 12,
-          "role": "user",
-          "text": "hello",
-          "createdAt": "2026-01-01T00:00:00.000Z"
+    func testWrongConversationCannotEnterSnapshot() async throws {
+        URLProtocolStubRegistry.shared.setHandler { _ in
+            .json(200, Fixtures.messagePage(messages: [Fixtures.message(conversationID: "other")], nextCursor: 1))
         }
-        """)
-
-        XCTAssertEqual(message.id, "msg-1")
-        XCTAssertEqual(message.seq, 12)
-        XCTAssertEqual(message.role, "user")
+        do {
+            _ = try await makeStubAPI().messages(Fixtures.session(), conversationID: Fixtures.conversationID,
+                                                 after: 0, waitSeconds: 0)
+            XCTFail("其它会话的数据必须拒绝")
+        } catch let error as POSAPIError {
+            guard case .decoding = error else { return XCTFail("应为解码错误") }
+        }
     }
 }

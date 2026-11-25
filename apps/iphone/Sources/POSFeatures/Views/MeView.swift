@@ -11,6 +11,10 @@ struct MeView: View {
             VStack(alignment: .leading, spacing: POSTheme.Spacing.l) {
                 profileCard
                 connectionCard
+                SectionCard(title: "当前能力", systemImage: "info.circle") {
+                    Text("v2 已接入会话和消息同步。任务、审批、计划、记忆和设备在线状态尚未接入。")
+                        .font(.footnote)
+                }
                 pairingEntry
                 signOutSection
             }
@@ -33,7 +37,7 @@ struct MeView: View {
             Button("取消", role: .cancel) {
             }
         } message: {
-            Text("将清除本机保存的配对凭据；聊天与任务的离线缓存保留在本机。")
+            Text("将清除本机保存的配对凭据；会话与消息的离线缓存保留在本机。")
         }
     }
 

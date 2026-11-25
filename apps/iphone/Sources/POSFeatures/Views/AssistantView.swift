@@ -22,7 +22,9 @@ struct AssistantView: View {
                 .padding(.top, POSTheme.Spacing.s)
             }
 
+            conversationPicker
             messageList
+            pendingMessages
             composer
         }
         .background(POSTheme.pageBackground)
@@ -31,6 +33,51 @@ struct AssistantView: View {
             RefreshToolbar(isRefreshing: model.isRefreshing) {
                 Task { await model.refresh() }
             }
+        }
+    }
+
+    private var conversationPicker: some View {
+        HStack {
+            Menu {
+                ForEach(model.conversations) { conversation in
+                    Button(conversation.title ?? "未命名会话") {
+                        model.selectConversation(conversation.id)
+                    }
+                }
+            } label: {
+                Label(model.selectedConversation?.title ?? (model.selectedConversationID == nil ? "选择会话" : "未命名会话"),
+                      systemImage: "bubble.left.and.bubble.right")
+                    .lineLimit(1)
+            }
+            .disabled(model.conversations.isEmpty)
+            Spacer()
+            Button {
+                Task { await model.createConversation() }
+            } label: {
+                Label(model.isCreatingConversation ? "创建中…" : "新会话", systemImage: "plus")
+            }
+            .disabled(model.isCreatingConversation)
+        }
+        .padding(POSTheme.Spacing.m)
+    }
+
+    @ViewBuilder
+    private var pendingMessages: some View {
+        if !model.currentPendingMessages.isEmpty {
+            VStack(alignment: .leading, spacing: POSTheme.Spacing.s) {
+                Text("待发送 / 结果未确认（重试保留原消息）")
+                    .font(.caption)
+                ForEach(model.currentPendingMessages) { pending in
+                    HStack {
+                        Text(pending.text).lineLimit(2)
+                        Spacer()
+                        Button("重试") { Task { await model.retryPending(pending) } }
+                            .disabled(model.isSending)
+                    }
+                }
+            }
+            .padding(POSTheme.Spacing.m)
+            .background(POSTheme.cardAlt)
         }
     }
 
@@ -129,7 +176,7 @@ struct AssistantView: View {
     }
 
     private var canSend: Bool {
-        guard model.phase.isReady, !model.isSending else { return false }
+        guard model.phase.isReady, model.selectedConversationID != nil, !model.isSending else { return false }
         return !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 

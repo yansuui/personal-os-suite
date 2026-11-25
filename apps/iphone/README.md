@@ -1,7 +1,7 @@
 # POSApp（iOS 客户端）
 
 Windows 上写代码 → GitHub Actions 出无签名 IPA → Sideloadly 装到 iPhone。
-接口事实源是 [`CONTRACT.md`](CONTRACT.md)（只读，改签名必须先改它）。
+跨端协议事实源是 [`MINIMAL-V2-CONTRACT.md`](../../packages/contracts/MINIMAL-V2-CONTRACT.md)，iPhone 内部装配及缓存兼容见 [`CONTRACT.md`](CONTRACT.md)。
 
 ## 1. 先说结论与限制
 
@@ -10,11 +10,27 @@ Windows 上写代码 → GitHub Actions 出无签名 IPA → Sideloadly 装到 i
 - 本地能做的：改 Swift / 改工程配置 / 改 workflow、按 `CONTRACT.md` 自检接口。
 - 交付物是 **未签名 IPA**，安装时由 Sideloadly 用你自己的 Apple ID 重签。
 
+## v2 最小聊天与本地验证
+
+- 只调用 v2：health、client 配对、me、创建/列出会话、按会话发送与增量读取消息；assistant 回复从云端消息流读取。
+- 主界面仅“聊天 / 我的”，聊天页可创建/选择会话。任务、审批、验收、计划、记忆和 presence 未接入，“我的”页明确标注。
+- 待发消息在请求前写入快照，自动重试、手动重试、重启后重试复用同一个 `clientRequestId`。会话独立保存游标，空页不归零，发送 ack 不跳过尚未读取的消息。
+- 保留原 Keychain service/account、快照文件和身份目录。旧全局时间线与任务/上下文只保留在快照中，不混入 v2 会话；v2 离线首屏恢复选中会话的消息与待发项。
+
+在 `apps/iphone` 目录离线执行：
+
+```powershell
+node --check scripts/validate-minimal-v2.cjs
+node scripts/validate-minimal-v2.cjs
+```
+
+本轮结果：11 组静态检查通过；扫描 34 个 Swift 源文件，发现 31 个 XCTest 用例声明，解析了 11 个字面 JSON 夹具。**这些是源码静态检查；Swift 编译与 XCTest 未执行。** 测试覆盖和 macOS 定向命令见 `CONTRACT.md`。
+
 ## 2. 目录与职责
 
 | 路径 | 职责 | 归属 |
 |---|---|---|
-| `CONTRACT.md` | 唯一接口事实源 | 只读，不改 |
+| `CONTRACT.md` | iPhone 内部 v2 接口与缓存兼容说明 | 与跨端冻结契约一致 |
 | `project.yml` | XcodeGen 工程定义（不提交 `.xcodeproj`） | A |
 | `Config/{Debug,Staging,Release}.xcconfig` | `BUNDLE_ID` / `POS_SERVER_URL` | A |
 | `Sources/POSApp/` | `POSApp.swift`（@main）、`AppConfig.swift` | A |
@@ -109,6 +125,7 @@ POS_SERVER_URL = https:/$()/api.example.com      // 线上
 
 | 项 | 状态 |
 |---|---|
-| `project.yml` / `Config/*.xcconfig` 结构、YAML 语法 | 本机静态校验通过（无 XcodeGen，未实际生成工程） |
-| Swift 代码（`POSApp.swift` / `AppConfig.swift`） | **未编译**（本机无工具链），以 CI 为准 |
-| CI workflow 语法 | 本机 YAML 解析通过，未在真实 runner 上跑过 |
+| v2 静态契约检查 | `node scripts/validate-minimal-v2.cjs`：11 组通过；34 个 Swift 源文件，31 个 XCTest 声明，11 个字面 JSON 夹具 |
+| 验证脚本语法 | `node --check scripts/validate-minimal-v2.cjs`：通过 |
+| Swift 编译 / POSCoreTests 执行 | **未验证**（本机未找到 swift、swiftc、xcodebuild、xcodegen） |
+| 云构建 / IPA / iPhone 真机 | 本轮未触发构建、未生成或安装 IPA、未做真机运行 |

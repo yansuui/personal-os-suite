@@ -4,68 +4,41 @@ import POSCore
 /// 测试夹具：只用公开 Codable 面构造值对象，不依赖内部 memberwise init。
 enum Fixtures {
     static let baseURL = URL(string: "http://127.0.0.1:8787")!
+    static let conversationID = "conv-1"
+    static let conversationJSON = #"{"id":"conv-1","ownerId":"default","title":"聊天","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}"#
+    static let deviceJSON = #"{"id":"device-1","name":"iPhone","role":"client","createdAt":"2026-01-01T00:00:00.000Z","lastSeenAt":null,"revokedAt":null}"#
 
     static func session(token: String = "test-token") throws -> AuthSession {
-        let json = """
-        {
-          "token": "\(token)",
-          "device": {
-            "id": "device-1",
-            "name": "iPhone",
-            "role": "client",
-            "kind": null,
-            "createdAt": "2026-01-01T00:00:00.000Z"
-          }
-        }
-        """
-        return try decode(AuthSession.self, from: json)
+        try decode(AuthSession.self, from: "{\"token\":\"\(token)\",\"device\":\(deviceJSON)}")
     }
 
-    static func sendMessageRequest(
-        clientRequestID: String = "req-1",
-        text: String = "hello"
-    ) throws -> SendMessageRequest {
-        let json = """
-        {
-          "clientRequestId": "\(clientRequestID)",
-          "text": "\(text)"
-        }
-        """
-        return try decode(SendMessageRequest.self, from: json)
+    static func sendMessageRequest(clientRequestID: String = "req-1", text: String = "hello") throws -> SendMessageRequest {
+        SendMessageRequest(clientRequestID: clientRequestID, text: text)
     }
 
     static func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
         try JSONDecoder().decode(type, from: Data(json.utf8))
     }
 
-    /// 时间线事件的典型 payload（字段名以服务端 chatTimelineJson 为准）。
-    static func timelineEvent(
-        messageID: String,
-        eventCursor: Int,
-        source: String = "phone",
-        text: String = "hi"
-    ) -> String {
-        """
-        {
-          "timelineId": "personal-assistant",
-          "messageId": "\(messageID)",
-          "source": "\(source)",
-          "eventCursor": \(eventCursor),
-          "text": "\(text)",
-          "createdAt": "2026-01-01T00:00:00.000Z"
-        }
+    static func message(messageID: String = "m1", seq: Int = 1, role: String = "user",
+                        text: String = "hello", conversationID: String = "conv-1",
+                        clientRequestID: String? = "req-1") -> String {
+        let key = clientRequestID.map { "\"\($0)\"" } ?? "null"
+        return """
+        {"id":"\(messageID)","conversationId":"\(conversationID)","clientRequestId":\(key),
+         "seq":\(seq),"role":"\(role)","text":"\(text)","createdAt":"2026-01-01T00:00:00.000Z"}
         """
     }
 
-    static func timelinePage(events: [String], nextCursor: Int?) -> String {
-        let cursor = nextCursor.map(String.init) ?? "null"
-        return """
-        {
-          "timelineId": "personal-assistant",
-          "events": [\(events.joined(separator: ","))],
-          "nextCursor": \(cursor),
-          "previousCursor": null
-        }
+    static func messagePage(messages: [String] = [], nextCursor: Int = 0) -> String {
+        "{\"messages\":[\(messages.joined(separator: ","))],\"nextCursor\":\(nextCursor)}"
+    }
+
+    static func sendAck(created: Bool = true, clientRequestID: String = "req-1") -> String {
+        """
+        {"message":\(message(clientRequestID: clientRequestID)),
+         "run":{"id":"run-1","conversationId":"conv-1","messageId":"m1","status":"queued"},
+         "created":\(created)}
         """
     }
 }

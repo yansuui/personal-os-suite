@@ -1,353 +1,86 @@
-# iPhone 客户端内部契约 v0（并行开发用）
+# iPhone v2 最小聊天契约
 
-> 本文件是三个子智能体并行开发时的唯一接口事实源。**改签名必须先改本文件**。
-> 服务端事实源在旧仓库 `C:\Users\QUIZ\Desktop\project\dsh-plugins\dsh-personal-os`
-> （`src/remote/server.ts` 路由、`src/remote/protocol.ts` wire 类型、`src/remote/pwa/client-js.ts` 行为）。
-> 本轮只做 iOS 端，不修改旧仓库任何文件。
+跨端协议事实源为 [`MINIMAL-V2-CONTRACT.md`](../../packages/contracts/MINIMAL-V2-CONTRACT.md)。本文描述 iPhone 内部装配和本地兼容行为，不扩展云端协议。
 
----
+## 范围
 
-## 1. 工程与目标
+本轮支持：v2 health、client 配对、me、创建/列出/选择会话、发送消息、增量长轮询读取 user/assistant/system 消息。
 
-| 项 | 值 |
-|---|---|
-| 根目录 | `C:\Users\QUIZ\Desktop\project\personal-os\apps\iphone` |
-| 工程生成 | XcodeGen（`project.yml`，不提交 `.xcodeproj`） |
-| Targets | `POSCore`（framework）、`POSFeatures`（framework，依赖 POSCore）、`POSApp`（app，依赖两者）、`POSCoreTests`（单元测试，依赖 POSCore） |
-| 最低系统 | iOS 17.0 |
-| Swift | 5.10 语言模式（Xcode 16 默认工具链） |
-| 第三方依赖 | 无。只用 Foundation / SwiftUI / Security / os |
-| Bundle ID | `$(BUNDLE_ID)`，xcconfig 默认 `com.personalos.ios` |
-| 版本 | `0.1.0`（build 1） |
-| 并发 | Swift Concurrency；核心层 `Sendable`；UI 层 `@MainActor` |
+任务、审批、验收、计划、记忆、presence、附件、推送和设备撤销均未接入。主界面仅“聊天 / 我的”；“我的”明确显示能力边界。旧功能没有网络协议方法，也不会伪造成功。旧视图只保留编译兼容，不提供入口。
 
-目标平台设置：`SUPPORTED_PLATFORMS=iphoneos iphonesimulator`、`TARGETED_DEVICE_FAMILY=1`、
-`SWIFT_VERSION=5.0`（对应 5.x 语言模式）、`IPHONEOS_DEPLOYMENT_TARGET=17.0`。
+## 工程与装配
 
----
+- 工程定义仍为 `project.yml`；POSCore / POSFeatures / POSApp / POSCoreTests 四个 target。
+- iOS 17+，Swift 5.x 语言模式，无第三方运行时依赖。
+- POSApp 注入 URLSessionPOSAPI 工厂；AppModel 按本次配对地址创建实现，保留原服务器地址 UserDefaults key。
+- Keychain service/account、设备可访问性和快照身份目录规则保持原样；不在日志中输出 token 或配对密钥。
 
-## 2. 文件所有权（并行开发，严禁越界）
-
-| 角色 | 只允许写 |
-|---|---|
-| A 工程/交付 | `project.yml`、`Config/*.xcconfig`、`Sources/POSApp/**`、`.github/workflows/**`、`scripts/**`、`README.md`、`.gitignore`、`Info.plist` 相关配置 |
-| B 核心层 | `Sources/POSCore/**`、`Tests/POSCoreTests/**` |
-| C 界面层 | `Sources/POSFeatures/**` |
-
-任何人不得修改其他角色的文件，也不得改 `CONTRACT.md`。
-
----
-
-## 3. POSCore 公开 API（B 实现 / A、C 只消费）
-
-签名必须逐字一致（属性名、标签、可选性）。B 可以增加 internal 实现细节，但不得改下列公开面。
+## POSCore 网络接口
 
 ```swift
-// MARK: 配置与错误
-
-public struct ServerConfig: Sendable, Equatable {
-    public var baseURL: URL
-    public init(baseURL: URL)
-}
-
-public enum POSAPIError: Error, Sendable, Equatable {
-    case transport(String)        // 网络不可达 / 超时
-    case unauthorized             // 401/403
-    case conflict(String)         // 409：版本冲突，调用方必须刷新而不是覆盖
-    case server(status: Int, code: String, message: String)
-    case decoding(String)
-}
-
-// MARK: 身份
-
-public struct DeviceInfo: Sendable, Codable, Equatable {
-    public let id: String
-    public let name: String
-    public let role: String        // "client" | "worker"
-    public let kind: String?       // "desktop" | "cloud-agent" | nil
-    public let createdAt: String
-}
-
-public struct AuthSession: Sendable, Codable, Equatable {
-    public let token: String
-    public let device: DeviceInfo
-}
-
-public struct PairRequest: Sendable, Codable, Equatable {
-    public var name: String
-    public var role: String        // 手机固定 "client"
-    public var kind: String?       // 手机固定 nil
-    public var capabilities: [String]
-}
-
-// MARK: 会话与时间线
-
-public struct ChatMessage: Sendable, Codable, Equatable, Identifiable {
-    public let id: String
-    public let seq: Int
-    public let role: String        // "user" | "assistant" | "system"
-    public let text: String
-    public let createdAt: String
-}
-
-public struct TimelinePage: Sendable, Codable, Equatable {
-    public let events: [ChatMessage]
-    public let nextCursor: Int?
-}
-
-public struct SendMessageRequest: Sendable, Codable, Equatable {
-    public var clientRequestID: String   // 幂等键，重试必须复用
-    public var text: String
-    public var conversationID: String?
-}
-
-public struct SendMessageAck: Sendable, Codable, Equatable {
-    public let messageID: String
-    public let runID: String?
-}
-
-// MARK: 任务 / 审批 / 验收
-
-public struct TaskSummary: Sendable, Codable, Equatable, Identifiable {
-    public let id: String
-    public let title: String
-    public let status: String      // queued|running|waiting-device|waiting-approval|completed|failed|canceled|unknown
-    public let updatedAt: String
-    public let requiresApproval: Bool
-    public let approvedAt: String?
-    public let verdict: String?    // "accepted" | "rejected" | nil
-    public let outputTail: String?
-    public let errorText: String?
-}
-
-public struct TaskList: Sendable, Codable, Equatable {
-    public let tasks: [TaskSummary]
-    public let counts: [String: Int]
-}
-
-// MARK: 只读上下文
-
-public struct PlanItem: Sendable, Codable, Equatable, Identifiable {
-    public let id: String
-    public let planDate: String
-    public let title: String
-    public let owner: String       // "me" | "ai"
-    public let startTime: String?
-    public let endTime: String?
-    public let minutes: Int?
-    public let status: String      // "todo" | "done" | "skipped"
-    public let progress: Int
-}
-
-public struct MemoryHit: Sendable, Codable, Equatable, Identifiable {
-    public let id: String
-    public let content: String
-    public let kind: String
-    public let tags: [String]
-    public let scope: String
-    public let importance: Int
-    public let updatedAt: String
-}
-
-public struct ContextSnapshot: Sendable, Codable, Equatable {
-    public let available: Bool
-    public let plan: [PlanItem]
-    public let memory: [MemoryHit]
-    public let asOf: String?
-}
-
-// MARK: 在线状态
-
-public struct Presence: Sendable, Codable, Equatable {
-    public let desktopOnline: Bool
-    public let cloudAgentOnline: Bool
-    public let queuedChat: Int
-}
-
-// MARK: 网络接口
-
 public protocol POSAPI: Sendable {
+    func health() async throws -> HealthResponse
     func pair(secret: String, _ request: PairRequest) async throws -> AuthSession
     func me(_ session: AuthSession) async throws -> DeviceInfo
-    func timeline(_ session: AuthSession, after: Int, waitSeconds: Int) async throws -> TimelinePage
-    func sendMessage(_ session: AuthSession, _ request: SendMessageRequest) async throws -> SendMessageAck
-    func tasks(_ session: AuthSession) async throws -> TaskList
-    func approve(_ session: AuthSession, taskID: String, approved: Bool, note: String?) async throws
-    func submitVerdict(_ session: AuthSession, taskID: String, verdict: String, note: String?) async throws
-    func context(_ session: AuthSession) async throws -> ContextSnapshot
-    func presence(_ session: AuthSession) async throws -> Presence
-}
-
-// MARK: 凭据与缓存
-
-public protocol CredentialStore: Sendable {
-    func load() throws -> AuthSession?
-    func save(_ session: AuthSession) throws
-    func clear() throws
-}
-
-public struct KeychainCredentialStore: CredentialStore {
-    public init(service: String = "com.personalos.ios.session")
-    // load/save/clear
-}
-
-public protocol SnapshotStore: Sendable {
-    func loadSnapshot() throws -> CachedSnapshot?
-    func saveSnapshot(_ snapshot: CachedSnapshot) throws
-}
-
-/// 默认实现：Application Support 下的 JSON 文件，按「服务器地址 + 设备 id」分目录。
-public struct FileSnapshotStore: SnapshotStore {
-    public init(directory: URL? = nil)
-}
-
-public struct CachedSnapshot: Sendable, Codable, Equatable {
-    public let savedAt: String
-    public let timeline: [ChatMessage]
-    public let cursor: Int
-    public let tasks: [TaskSummary]
-    public let context: ContextSnapshot?
-}
-
-// MARK: 同步
-
-public enum SyncEvent: Sendable {
-    case connected
-    case disconnected(POSAPIError)
-    case messages([ChatMessage])
-    case cursor(Int)
-}
-
-public actor SyncEngine {
-    public init(api: POSAPI, session: AuthSession, store: SnapshotStore, waitSeconds: Int)  // waitSeconds 默认 20
-    public func start() -> AsyncStream<SyncEvent>
-    public func stop()
-    public func resendPending() async
+    func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation
+    func conversations(_ session: AuthSession) async throws -> [Conversation]
+    func messages(_ session: AuthSession, conversationID: String, after: Int, waitSeconds: Int) async throws -> MessagePage
+    func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck
 }
 ```
 
-行为要求（B 必须实现，C 依赖）：
-1. **分档超时**：普通请求 15s；长轮询按 `waitSeconds + 10` 秒计算（至少 30s）。
-2. **幂等**：`SendMessageRequest.clientRequestID` 由调用方生成；重试复用同一个值。
-3. **409 不覆盖**：`POSAPIError.conflict` 一律向上抛，由 UI 刷新；不得自动合并。
-4. **游标**：`timeline(after:)` 用上次 `nextCursor`；拿不到就保留旧游标，不重置为 0。
-5. **断线重连**：指数退避 1s→30s，封顶 30s；`stop()` 后不再发起请求。
-6. **Keychain**：`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`；错误不得带 token 正文。
-
----
-
-## 4. POSFeatures 公开 API（C 实现 / A 只消费）
-
-```swift
-@MainActor
-public final class AppModel: ObservableObject {
-    public init(serverURL: URL,
-                api: POSAPI? = nil,
-                apiFactory: ((URL) -> (any POSAPI))? = nil,
-                credentials: CredentialStore = KeychainCredentialStore(),
-                store: SnapshotStore? = nil)
-
-    @Published public private(set) var phase: AppPhase      // .signedOut / .pairing / .ready / .failed(String)
-    @Published public private(set) var messages: [ChatMessage]
-    @Published public private(set) var tasks: [TaskSummary]
-    @Published public private(set) var context: ContextSnapshot?
-    @Published public private(set) var presence: Presence?
-    @Published public private(set) var lastSyncedAt: Date?
-
-    public func bootstrap() async
-    public func pair(serverURL: URL, secret: String, deviceName: String) async
-    public func signOut()
-    public func refresh() async
-    public func send(_ text: String) async
-    public func approve(taskID: String) async
-    public func reject(taskID: String, note: String?) async
-    public func accept(taskID: String) async
-    public func requestRework(taskID: String, note: String?) async
-}
-
-public struct RootView: View {
-    public init(model: AppModel)
-    public var body: some View
-}
-
-public enum AppPhase: Equatable, Sendable {
-    case signedOut
-    case pairing
-    case ready
-    case failed(String)
-}
-```
-
-`RootView` 内含底部五个 Tab：`TodayView`、`AssistantView`、`TasksView`、`MemoryView`、`MeView`。
-`AppModel` 内部用 `SyncEngine` + `SnapshotStore`，不得直接 new 网络栈。
-
----
-
-## 5. POSApp（A 实现）
-
-```swift
-@main
-struct POSApp: App {
-    @StateObject private var model: AppModel
-    init() {
-        let url = AppConfig.serverURL
-        let api = URLSessionPOSAPI(config: ServerConfig(baseURL: url))
-        _model = StateObject(wrappedValue: AppModel(serverURL: url, api: api))
-    }
-    var body: some Scene { WindowGroup { RootView(model: model) } }
-}
-```
-
-`AppConfig.serverURL` 从 `Info.plist` 的 `POSServerURL`（xcconfig 注入）读取；缺省
-`http://127.0.0.1:3080`（Debug）。ATS：Debug 允许明文到 localhost，Release 不允许。
-
----
-
-## 6. 服务端契约（只读事实源）
-
-端点（均需 `Authorization: Bearer <token>`，除 `/v1/pair` 与 `/v1/health`）：
-
-| 方法 | 路径 | 用途 |
+| 方法 | 路径 | wire shape |
 |---|---|---|
-| POST | `/v1/pair` | 配对：需请求头 `x-pair-secret: <配对密钥>`，返回 `{ device, token }` |
-| GET | `/v1/me` | 当前设备 |
-| GET | `/v1/health` | 健康检查（无鉴权） |
-| GET | `/v1/timeline/events?after=<int>&wait=<int>` | 长轮询事件流 |
-| POST | `/v1/chat/messages` | 发消息（带幂等键） |
-| GET | `/v1/tasks` | 任务列表 |
-| GET | `/v1/tasks/:id` | 单任务 |
-| POST | `/v1/tasks/:id/approve` | 审批 |
-| POST | `/v1/tasks/:id/verdict` | 验收 |
-| GET | `/v1/context` | 计划/记忆快照 |
-| GET | `/v1/presence` | 在线状态 |
+| GET | `/v2/health` | `{ok,service,protocolVersion}`，无凭据 |
+| POST | `/v2/pair` | body `{name,role:"client"}`，仅 `x-pair-secret`；返回 `{device,token}` |
+| GET | `/v2/me` | `{device}` |
+| POST | `/v2/conversations` | `{title?}` → `{conversation}` |
+| GET | `/v2/conversations` | `{conversations}` |
+| POST | `/v2/conversations/:conversationId/messages` | `{clientRequestId,text}` → `{message,run,created}`，201/200 均可 |
+| GET | `/v2/conversations/:conversationId/messages?after=&wait=` | `{messages,nextCursor}`，游标为非可选整数 |
 
-B 必须对照 `src/remote/server.ts`（各 handler 的字段读取）与 `src/remote/protocol.ts` 修正
-Codable 字段名，**以服务端实际读取的字段为准**，与本文第 3 节类型名保持一一对应（可用
-`CodingKeys` 适配）。发现契约冲突时，在实现处加 `// CONTRACT-DEVIATION:` 注释并在 PR 说明中列出。
+除 health/pair 外使用 Bearer。普通请求超时 15 秒；长轮询 wait 限定 0...25 秒，HTTP 超时 `max(30, wait + 10)`。会话 ID 按 `[A-Za-z0-9_-]+` 验证，不能拼出其它路径。
 
----
+Message 使用 `id/conversationId/role/text/clientRequestId/seq/createdAt`。Swift 属性 `conversationID`、`clientRequestID` 通过 CodingKeys 映射。`conversationID` 只为读取升级前的本地快照允许 nil，v2 HTTP 响应会验证其属于请求会话。
 
-## 7. 验收（本轮）
+Run 只读取 `id/status/conversationId/messageId`，不领取、不完成 agent 运行，也不保存 leaseToken。assistant 消息来自云端增量消息端点。
 
-CI（`.github/workflows/ios-ipa.yml`）必须能：
-1. `brew install xcodegen` → `xcodegen generate`；
-2. 模拟器上跑 `POSCoreTests`（至少覆盖：分档超时、幂等键复用、409 冲突、游标不重置、Keychain 读写 mock）；
-3. 无签名构建 Release：`CODE_SIGNING_ALLOWED=NO`，打包 `Payload/POSApp.app` → `POSApp-unsigned.ipa`；
-4. 上传 artifact。
+## 同步与幂等
 
-本机（Windows）无法编译 Swift，因此**本轮代码未经编译验收**，以 CI 结果为准。
+- SyncEngine 每个实例绑定一个 conversationID，从 `conversationStates` 中恢复该会话的游标。不会沿用旧全局时间线的游标。
+- 成功响应后才报告 connected；消息按 seq 合并后推进 nextCursor。空页保持请求 cursor。断线按 1→2→4→…→30 秒退避；stop 取消在途请求并结束事件流。
+- AppModel 在选会话时保存当前会话状态并切换同步实例。旧身份和旧同步代次的迟到结果不回写新状态。
+- PendingMessage 在首次网络发送前原子写入快照。键由客户端生成一次；自动重试、手动重试和重启恢复始终复用原 `clientRequestId` 与正文。
+- 只有传输错误或 5xx 自动重试一次；409 保留原待发数据并刷新，不能覆盖本地新数据。其它失败保留待发项供用户明确重试。
+- ack 保存服务端 message/run 的事实；不能用 ack 的 seq 推进消息轮询游标，以免跳过尚未读取的 assistant 消息。
 
----
+## 本地数据兼容
 
-## 8. 实现期间登记的偏差（v0.1）
+- AuthSession 仍为 `{token,device}`；Keychain service `com.personalos.ios.session`、account `session`、`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` 不变。
+- FileSnapshotStore 仍在“服务器 URL + device ID”稳定摘要目录写 `snapshot.json`，使用 `.atomic`。
+- CachedSnapshot 新增 conversations、selectedConversationID、conversationStates、pendingMessages。缺失新字段按空值读取。
+- 升级前 timeline/cursor/tasks/context 字段保留并回写，既有文件不删除、不迁走。旧全局时间线没有可靠的 v2 conversationId，因此不混入新会话，也不把旧任务/上下文展示成已接入的能力。
+- 离线首屏从快照恢复 v2 选中会话、历史消息及待发项，再发起刷新。配对失败保留原会话；退出只清凭据，保留身份目录的缓存。
 
-| # | 偏差 | 原因 | 后续 |
-|---|---|---|---|
-| D-1 | `approve(approved: false)` 改打 `POST /v1/tasks/:id/cancel` | v1 的 `/approve` 无条件批准、没有拒绝分支；照打会让「拒绝」静默变成「批准」 | 云端 `ApprovalService` 落地后补 reject 端点并改回 |
-| D-2 | `POSApp` 显式注入 `URLSessionPOSAPI` | 契约只声明协议，无法在 Features 层实例化实现（避免反向依赖） | 保持不变，装配点固定在 App 层 |
-| D-3 | `FileSnapshotStore(directory:)` 由调用方传入身份目录 | 契约初始化器只有目录参数，拿不到 baseURL/设备 id | `AppModel` 用 FNV-1a 派生 `serverURL+deviceId` 目录 |
-| D-4 | 为 `PairRequest`/`ChatMessage`/`SendMessageRequest`/`CachedSnapshot` 补 `public init` | Swift 隐式 memberwise init 是 internal，跨模块无法构造 | 保留（纯加法） |
-| D-5 | `TaskList.counts` 缺失时退化为 `[:]`；`ContextSnapshot` 从 `snapshots[]` 摊平 | 服务端 `/v1/tasks` 只返回 `{tasks}`，`/v1/context` 返回快照数组 | 云端改契约后收紧 |
-| D-6 | `AppPhase` 定义在 POSFeatures | 契约 §4 引用了它但 §3 未定义 | 若迁入 POSCore，删除 Features 内定义即可 |
-| D-7 | ATS 放开 `NSAllowsArbitraryLoads` | 真机需连局域网 http 网关，XcodeGen 单份 Info.plist 无法按配置区分 | 发布前拆 Debug/Release plist |
-| D-8 | `AppModel` 增加 `apiFactory` 参数，并持久化已配对服务器地址 | 否则配对页填的地址不参与请求、重启回到默认地址 | 保持；契约 §4 已同步 |
+## 验证
+
+Windows 可离线执行：
+
+```powershell
+# 工作目录 apps/iphone
+node --check scripts/validate-minimal-v2.cjs
+node scripts/validate-minimal-v2.cjs
+```
+
+静态检查核对冻结路由、字段、认证、轮询边界、持久幂等键、会话游标隔离、未接入 UI、Keychain/原子快照设置和 XCTest 夹具。它不能证明 Swift 可以编译或测试已运行。
+
+POSCoreTests 的定向用例覆盖：health/pair/me、创建/列出会话、201/200 幂等重放与跨重启键复用、assistant 增量读取、空页游标、会话游标隔离、断线重连/stop、25 秒等待上限、409、旧快照兼容及凭据协议。
+
+macOS/Xcode 环境可运行（本轮未执行）：
+
+```sh
+xcodegen generate
+xcodebuild test -project POSApp.xcodeproj -scheme POSApp -destination 'platform=iOS Simulator,name=iPhone 16' -only-testing:POSCoreTests CODE_SIGNING_ALLOWED=NO
+```
+
+模拟器名称需以该机器可用设备为准。本机无 Swift/Xcode/XcodeGen，**Swift 编译和 XCTest 执行未验证**；未触发云构建、未生成或安装 IPA、未进行 iPhone 真机验证。
