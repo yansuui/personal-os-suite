@@ -79,6 +79,7 @@ struct MeView: View {
         SectionCard(title: "连接", systemImage: "network") {
             VStack(alignment: .leading, spacing: POSTheme.Spacing.s) {
                 InfoRow(label: "服务器地址", value: model.serverURL.absoluteString)
+                InfoRow(label: "模型", value: model.modelDisplayName)
                 InfoRow(label: "设备名", value: model.deviceName.isEmpty ? "未配对" : model.deviceName)
                 InfoRow(label: "配对状态", value: model.phase.displayName)
                 InfoRow(label: "最后同步", value: POSDate.relative(model.lastSyncedAt))

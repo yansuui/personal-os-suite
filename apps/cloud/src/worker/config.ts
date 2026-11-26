@@ -26,6 +26,7 @@ export function configFromEnvironment(env: NodeJS.ProcessEnv = process.env): Wor
     agentToken: secret(env, 'POS_AGENT_TOKEN') ?? '',
     modelEndpoint: env.POS_MODEL_ENDPOINT ?? '',
     model: env.POS_MODEL ?? '',
+    modelApi: (env.POS_MODEL_API ?? 'chat-completions') as WorkerConfig['modelApi'],
     apiKey: secret(env, 'POS_MODEL_API_KEY'),
     leaseMs: number(env, 'POS_WORKER_LEASE_MS', 120_000),
     requestTimeoutMs: number(env, 'POS_WORKER_REQUEST_TIMEOUT_MS', 10_000),

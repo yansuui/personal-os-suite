@@ -17,10 +17,19 @@ final class RequestShapeTests: XCTestCase {
         }
         let health = try await makeStubAPI().health()
         XCTAssertEqual(health.protocolVersion, 2)
+        XCTAssertNil(health.model)
         let request = try XCTUnwrap(URLProtocolStubRegistry.shared.requests.first)
         XCTAssertEqual(request.stubPath, "/v2/health")
         XCTAssertNil(request.value(forHTTPHeaderField: "authorization"))
         XCTAssertNil(request.value(forHTTPHeaderField: "x-pair-secret"))
+    }
+
+    func testHealthDecodesOptionalModel() async throws {
+        URLProtocolStubRegistry.shared.setHandler { _ in
+            .json(200, #"{"ok":true,"service":"personal-os-cloud","protocolVersion":2,"model":"provider/model-next"}"#)
+        }
+        let health = try await makeStubAPI().health()
+        XCTAssertEqual(health.model, "provider/model-next")
     }
 
     func testPairUsesOnlyNameRoleAndPairSecret() async throws {

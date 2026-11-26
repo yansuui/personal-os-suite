@@ -13,7 +13,7 @@ const dbPath = process.env.DB_PATH ?? './data/cloud.sqlite'
 if (dbPath.trim().length === 0) throw new Error('DB_PATH must not be empty.')
 
 const store = new CloudStore(dbPath)
-const server = createV2Server({ store, adminSecret })
+const server = createV2Server({ store, adminSecret, model: process.env.POS_MODEL })
 let stopping = false
 let storeClosed = false
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { configFromEnvironment } from '../src/worker/config.ts'
 import {
   ChatWorker,
   WorkerError,
@@ -42,6 +43,14 @@ function mockFetch(handler: (url: URL, init: RequestInit) => Response | Promise<
     return await handler(new URL(requestUrl), init)
   }
 }
+
+test('environment selects the model protocol explicitly and rejects unknown values', () => {
+  const env = { POS_API_BASE_URL: baseConfig.apiBaseUrl, POS_AGENT_TOKEN: baseConfig.agentToken,
+    POS_MODEL_ENDPOINT: baseConfig.modelEndpoint, POS_MODEL: baseConfig.model }
+  assert.equal(configFromEnvironment(env).modelApi, 'chat-completions')
+  assert.equal(configFromEnvironment({ ...env, POS_MODEL_API: 'responses' }).modelApi, 'responses')
+  workerError(() => configFromEnvironment({ ...env, POS_MODEL_API: 'unknown' }), 'invalid_config')
+})
 
 test('completion can use its reserved lease budget after context and model generation', async (t) => {
   let clock = 0

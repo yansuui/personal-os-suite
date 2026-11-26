@@ -16,6 +16,8 @@ const POLL_INTERVAL_MS = 250
 export interface V2ServerOptions {
   store: CloudStoreApi
   adminSecret: string
+  /** Public configured worker model; never pass endpoint URLs or credentials. */
+  model?: string
   now?: StoreClock
 }
 
@@ -193,9 +195,13 @@ async function pollMessages(
   }
 }
 
-export function createV2Server({ store, adminSecret, now = () => new Date() }: V2ServerOptions): Server {
+export function createV2Server({ store, adminSecret, model, now = () => new Date() }: V2ServerOptions): Server {
   if (typeof adminSecret !== 'string' || adminSecret.length === 0) {
     throw new TypeError('adminSecret must be a non-empty string.')
+  }
+  const modelName = model?.trim()
+  if (modelName !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(modelName)) {
+    throw new TypeError('model must be a model identifier of at most 200 characters.')
   }
 
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -220,7 +226,10 @@ export function createV2Server({ store, adminSecret, now = () => new Date() }: V
 
     if (method === 'GET' && path === '/v2/health') {
       queryFields(url)
-      sendJson(response, 200, { ok: true, service: 'personal-os-cloud', protocolVersion: 2, dbPath: store.dbPath })
+      sendJson(response, 200, {
+        ok: true, service: 'personal-os-cloud', protocolVersion: 2, dbPath: store.dbPath,
+        ...(modelName === undefined ? {} : { model: modelName }),
+      })
       return
     }
     if (method === 'POST' && path === '/v2/pair') {

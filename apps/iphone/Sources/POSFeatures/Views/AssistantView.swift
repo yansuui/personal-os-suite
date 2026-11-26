@@ -23,6 +23,14 @@ struct AssistantView: View {
             }
 
             conversationPicker
+            Text("模型：\(model.modelDisplayName)")
+                .font(.footnote)
+                .foregroundStyle(POSTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .padding(.horizontal, POSTheme.Spacing.m)
+                .padding(.bottom, POSTheme.Spacing.s)
             messageList
             pendingMessages
             composer

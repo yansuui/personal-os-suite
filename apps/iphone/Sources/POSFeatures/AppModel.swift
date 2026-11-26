@@ -14,6 +14,8 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var cancelingRunIDs: Set<String> = []
     @Published public private(set) var lastSyncedAt: Date?
     @Published public private(set) var connection: ConnectionState = .unknown
+    @Published public private(set) var serverModel: String?
+    @Published private var hasCurrentModel = false
     @Published public private(set) var serverURL: URL
     @Published public private(set) var session: AuthSession?
     @Published public private(set) var isRefreshing = false
@@ -62,6 +64,11 @@ public final class AppModel: ObservableObject {
     }
 
     public var deviceName: String { session?.device.name ?? "" }
+    public var modelDisplayName: String {
+        guard let serverModel else { return "服务器未提供型号" }
+        return hasCurrentModel && connection.isOnline && phase.isReady
+            ? serverModel : "\(serverModel)（上次连接）"
+    }
     public var selectedConversation: Conversation? {
         conversations.first { $0.id == selectedConversationID }
     }
@@ -108,6 +115,8 @@ public final class AppModel: ObservableObject {
         let canRestoreSession = phase.isReady && session != nil
         identityGeneration += 1
         let generation = identityGeneration
+        serverModel = nil
+        hasCurrentModel = false
         stopSync()
         stopRunPolling()
         cancelingRunIDs = []
@@ -170,6 +179,8 @@ public final class AppModel: ObservableObject {
 
     private func resetChat() {
         hasValidatedServer = false
+        serverModel = nil
+        hasCurrentModel = false
         messages = []
         conversations = []
         selectedConversationID = nil
@@ -192,6 +203,7 @@ public final class AppModel: ObservableObject {
         guard phase.isReady, !isRefreshing, let api, let session else { return }
         let generation = identityGeneration
         isRefreshing = true
+        hasCurrentModel = false
         defer {
             if generation == identityGeneration {
                 isRefreshing = false
@@ -201,11 +213,14 @@ public final class AppModel: ObservableObject {
             }
         }
         do {
-            _ = try await api.health()
+            let health = try await api.health()
             guard generation == identityGeneration else { return }
             hasValidatedServer = true
             let device = try await api.me(session)
+            guard generation == identityGeneration else { return }
             guard device.role == "client" else { throw POSAPIError.unauthorized }
+            let model = health.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+            serverModel = model?.isEmpty == false ? model : nil
             let list = try await api.conversations(session)
             guard generation == identityGeneration else { return }
             var byID = Dictionary(conversations.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
@@ -227,6 +242,7 @@ public final class AppModel: ObservableObject {
             }
             guard generation == identityGeneration else { return }
             connection = .online
+            hasCurrentModel = true
             lastSyncedAt = Date()
             needsRefresh = false
             persistSnapshot()
@@ -461,6 +477,7 @@ public final class AppModel: ObservableObject {
 
     private func handle(_ error: Error) {
         let failure = POSCoreBridge.apiError(from: error)
+        hasCurrentModel = false
         connection = .offline(POSCoreBridge.message(for: failure))
         notice = POSCoreBridge.message(for: failure)
         switch failure {

@@ -28,7 +28,7 @@
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/v2/health` | 无 | `{ok, service, protocolVersion, dbPath?}`（不回显密钥） |
+| GET | `/v2/health` | 无 | `{ok, service, protocolVersion, dbPath?, model?}`（`model` 是当前配置型号，可缺省；不回显模型端点或密钥，不表示 worker 在线或历史回复归属） |
 | POST | `/v2/pair` | `x-pair-secret` | `{name, role}` → 201 `{device, token}` |
 | GET | `/v2/me` | Bearer | `{device}` |
 | POST | `/v2/conversations` | Bearer | `{title?}` → 201 `{conversation}` |

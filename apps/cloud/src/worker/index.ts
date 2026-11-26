@@ -6,6 +6,7 @@ export interface WorkerConfig {
   agentToken: string
   modelEndpoint: string
   model: string
+  modelApi?: 'chat-completions' | 'responses'
   apiKey?: string
   leaseMs: number
   requestTimeoutMs: number
@@ -53,6 +54,7 @@ function integer(value: number, minimum: number, maximum: number): void {
 export function validateWorkerConfig(config: WorkerConfig): void {
   url(config.apiBaseUrl)
   url(config.modelEndpoint)
+  if (config.modelApi !== undefined && !['chat-completions', 'responses'].includes(config.modelApi)) throw new WorkerError('invalid_config')
   if (!config.agentToken || /\s/.test(config.agentToken) || !config.model?.trim() ||
       (config.apiKey !== undefined && (!config.apiKey || /[\r\n]/.test(config.apiKey)))) throw new WorkerError('invalid_config')
   integer(config.leaseMs, 1_000, 86_400_000)
@@ -185,14 +187,19 @@ export class ChatWorker {
     throw new WorkerError('context_limit')
   }
 
-  async #generate(messages: ChatTurn[], signal: AbortSignal): Promise<string> {
+  async #generate(messages: ChatTurn[], signal: AbortSignal, conversationId: string): Promise<string> {
     const modelSignal = AbortSignal.any([signal, AbortSignal.timeout(this.config.modelTimeoutMs)])
+    const responses = this.config.modelApi === 'responses'
+    const body = responses
+      ? { model: this.config.model, input: messages, stream: false, store: false,
+        prompt_cache_key: `personal-os-v2-${conversationId}`, max_output_tokens: this.config.maxOutputTokens }
+      : { model: this.config.model, messages, stream: false, max_tokens: this.config.maxOutputTokens }
     try {
       const response = await this.#fetch(this.config.modelEndpoint, {
         method: 'POST',
         headers: { accept: 'application/json', 'content-type': 'application/json',
           ...(this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : {}) },
-        body: JSON.stringify({ model: this.config.model, messages, stream: false, max_tokens: this.config.maxOutputTokens }),
+        body: JSON.stringify(body),
         redirect: 'error', signal: modelSignal,
       })
       if (!response.ok) {
@@ -200,10 +207,26 @@ export class ChatWorker {
         throw new WorkerError('model_http_error', response.status)
       }
       const result = object(await json(response, 1024 * 1024, modelSignal))
-      const choices = result.choices
-      if (!Array.isArray(choices) || !choices.length) throw new WorkerError('invalid_model_response')
-      const choice = object(choices[0])
-      const content = object(choice.message).content
+      let content: unknown
+      if (responses) {
+        if (result.status !== 'completed' || !Array.isArray(result.output)) throw new WorkerError('invalid_model_response')
+        const texts: string[] = []
+        for (const value of result.output) {
+          const item = object(value)
+          if (item.type !== 'message') continue
+          if (item.role !== 'assistant' || item.status !== 'completed' || !Array.isArray(item.content)) throw new WorkerError('invalid_model_response')
+          for (const value of item.content) {
+            const part = object(value)
+            if (part.type !== 'output_text' || typeof part.text !== 'string') throw new WorkerError('invalid_model_response')
+            texts.push(part.text)
+          }
+        }
+        content = texts.join('')
+      } else {
+        const choices = result.choices
+        if (!Array.isArray(choices) || !choices.length) throw new WorkerError('invalid_model_response')
+        content = object(object(choices[0]).message).content
+      }
       if (typeof content !== 'string' || !content.trim() || content.length > 200_000) throw new WorkerError('invalid_model_response')
       return content
     } catch (error) {
@@ -259,7 +282,7 @@ export class ChatWorker {
       let errorText: string | undefined
       try {
         const messages = await this.#context(run, workSignal)
-        resultText = await this.#generate(messages, workSignal)
+        resultText = await this.#generate(messages, workSignal, run.conversationId)
       } catch (error) {
         if (parent.aborted) return { status: 'stopped', runId: run.id }
         if (workSignal.aborted) return { status: 'discarded', runId: run.id }

@@ -148,10 +148,10 @@ interface CallOptions {
   headers?: Record<string, string>
 }
 
-async function setup(t: TestContext) {
+async function setup(t: TestContext, model?: string) {
   const store = new MemoryStore()
   const now = new Date('2026-11-25T01:00:00.000Z')
-  const server = createV2Server({ store, adminSecret: 'test-pair-secret', now: () => now })
+  const server = createV2Server({ store, adminSecret: 'test-pair-secret', model, now: () => now })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const address = server.address()
@@ -209,6 +209,22 @@ test('public health reports protocol v2 without exposing credentials', async (t)
   assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8')
   assert.equal(response.headers.get('cache-control'), 'no-store')
   assert.doesNotMatch(JSON.stringify(response.json), /test-pair-secret/)
+})
+
+test('public health optionally reports only the configured model identifier', async (t) => {
+  const { call } = await setup(t, '  gpt-6.1-sol  ')
+  const response = await call('/v2/health')
+  assert.equal(response.status, 200)
+  assert.deepEqual(response.json, {
+    ok: true, service: 'personal-os-cloud', protocolVersion: 2, dbPath: ':memory:', model: 'gpt-6.1-sol',
+  })
+  assert.equal(response.headers.get('cache-control'), 'no-store')
+})
+
+test('model metadata rejects empty, multiline and credential URL values', () => {
+  for (const model of ['', '  ', 'model\nprivate', 'https://user@provider.invalid/model', 'x'.repeat(201)]) {
+    assert.throws(() => createV2Server({ store: new MemoryStore(), adminSecret: 'test-only', model }), /model must be/)
+  }
 })
 
 test('pair requires the secret, returns random tokens once, and stores only SHA-256', async (t) => {

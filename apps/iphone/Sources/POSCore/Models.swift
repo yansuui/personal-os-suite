@@ -29,6 +29,7 @@ public struct HealthResponse: Sendable, Codable, Equatable {
     public let ok: Bool
     public let service: String
     public let protocolVersion: Int
+    public let model: String?
 }
 
 public struct Conversation: Sendable, Codable, Equatable, Identifiable {

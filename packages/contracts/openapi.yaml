@@ -427,6 +427,12 @@ components:
         dbPath:
           type: string
           description: Optional database path; never includes credentials.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$'
+          description: Optional configured worker request model identifier. Not per-message upstream provenance or a worker liveness signal. No endpoints or credentials.
     DeviceRole:
       type: string
       enum: [client, agent]

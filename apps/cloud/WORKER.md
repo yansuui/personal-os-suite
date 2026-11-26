@@ -1,6 +1,6 @@
 # 云端聊天 Worker
 
-独立 worker 是与 v2 HTTP API 分开的进程；云端 API server 自身不连接或调用模型。Worker 通过冻结的 `/v2` HTTP agent 接口领取任务，调用兼容 OpenAI `chat/completions` 的模型端点，再提交完成结果。
+独立 worker 是与 v2 HTTP API 分开的进程；云端 API server 自身不连接或调用模型。Worker 通过冻结的 `/v2` HTTP agent 接口领取任务，调用显式配置的 OpenAI 兼容 Chat Completions 或 Responses 模型端点，再提交完成结果。
 
 ## 显式配置
 
@@ -12,6 +12,7 @@
 | `POS_AGENT_TOKEN` 或 `POS_AGENT_TOKEN_FILE` | 是 | 已配对且 role 为 `agent` 的设备凭据。不能与模型 API key 混用。 |
 | `POS_MODEL_ENDPOINT` | 是 | 完整 chat/completions URL；只允许 HTTPS 或 loopback HTTP。 |
 | `POS_MODEL` | 是 | 上游模型名。 |
+| `POS_MODEL_API` | 否 | `chat-completions`（默认）或 `responses`；必须与完整模型 URL 匹配。Responses 使用 `input`、`max_output_tokens`、`store:false` 和按会话稳定的 `prompt_cache_key`，只提交 `status:completed` 中的 assistant `output_text`；不将 reasoning、工具调用或 incomplete 响应作为回复。 |
 | `POS_MODEL_API_KEY` 或 `POS_MODEL_API_KEY_FILE` | 否 | 只发给模型端点的 Bearer 凭据，绝不会用作 agent token。 |
 | `POS_WORKER_LEASE_MS` | 否 | 120000 ms。 |
 | `POS_WORKER_REQUEST_TIMEOUT_MS` | 否 | 10000 ms。 |
@@ -20,7 +21,7 @@
 | `POS_WORKER_POLL_MS` | 否 | 1000 ms。 |
 | `POS_WORKER_CONTEXT_MESSAGES` | 否 | 60 条消息。 |
 | `POS_WORKER_CONTEXT_CHARS` | 否 | 60000 字符；这是字符上限，不是 tokenizer 计算的 token 数。 |
-| `POS_WORKER_OUTPUT_TOKENS` | 否 | 2048，作为 `max_tokens` 传给模型；响应文本另有 200000 字符上限。 |
+| `POS_WORKER_OUTPUT_TOKENS` | 否 | 2048，按模型协议作为 `max_tokens` 或 `max_output_tokens` 传给模型；响应文本另有 200000 字符上限。 |
 
 URL 不接受 userinfo、query 或 fragment。密钥可直接通过环境变量提供，也可用对应的 `_FILE` 变量从文件读取；同一凭据的两种来源不能同时设置。不要把密钥写入日志、代码库或命令历史。
 

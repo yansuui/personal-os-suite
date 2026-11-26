@@ -53,10 +53,10 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
   }
 }
 
-type ModelRequest = { model: string; messages: Array<{ role: string; content: string }>; stream?: boolean }
+type ModelRequest = { model: string; messages: Array<{ role: string; content: string }>; input?: Array<{ role: string; content: string }>; stream?: boolean; store?: boolean; prompt_cache_key?: string; max_output_tokens?: number }
 type ModelHandler = (body: ModelRequest, response: ServerResponse, request: IncomingMessage) => void
 
-async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => Date) {
+async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => Date, modelApi: WorkerConfig['modelApi'] = 'chat-completions') {
   const directory = mkdtempSync(join(tmpdir(), 'personal-os-worker-e2e-'))
   const store = new CloudStore(join(directory, 'cloud.sqlite'), now)
   const servers: Server[] = []
@@ -105,7 +105,7 @@ async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => D
   const requests: ModelRequest[] = []
   const modelServer = createServer(async (request, response) => {
     try {
-      assert.equal(request.url, '/v1/chat/completions')
+      assert.equal(request.url, modelApi === 'responses' ? '/v1/responses' : '/v1/chat/completions')
       assert.equal(request.method, 'POST')
       assert.equal(request.headers.authorization, `Bearer ${modelKey}`)
       let text = ''
@@ -122,7 +122,8 @@ async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => D
   const config = {
     apiBaseUrl,
     agentToken: agent.data.token,
-    modelEndpoint: `${modelBaseUrl}/v1/chat/completions`,
+    modelEndpoint: `${modelBaseUrl}${modelApi === 'responses' ? '/v1/responses' : '/v1/chat/completions'}`,
+    modelApi,
     model: 'local-test-model',
     apiKey: modelKey,
     leaseMs: 15_000,
@@ -289,4 +290,84 @@ test('a client credential is rejected before leasing or invoking the model', asy
   await assert.rejects(() => f.execute(f.worker({ agentToken: f.clientToken })))
   assert.equal((await f.run(sent.data.run.id)).data.run.status, 'queued')
   assert.equal(f.requests.length, 0)
+})
+
+function responsesAnswer(response: ServerResponse, text: string, status = 'completed'): void {
+  response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status, output: [
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'private reasoning' }] },
+    { type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] },
+  ] }))
+}
+
+test('Responses generates real HTTP/SQLite replies with stable cache key and prior context', async (t) => {
+  const f = await fixture(t, (body, response) => {
+    assert.equal(body.stream, false)
+    assert.equal(body.store, false)
+    assert.equal(body.max_output_tokens, 200)
+    assert.equal(body.messages, undefined)
+    assert.ok(body.prompt_cache_key)
+    responsesAnswer(response, `reply:${body.input!.at(-1)!.content}`)
+  }, undefined, 'responses')
+  const first = await f.send('first question', 'responses-first')
+  assert.equal((await f.execute(f.worker())).status, 'completed')
+  const second = await f.send('follow up')
+  assert.equal((await f.execute(f.worker())).status, 'completed')
+  assert.equal((await f.run(first.data.run.id)).data.run.status, 'completed')
+  assert.equal((await f.run(second.data.run.id)).data.run.status, 'completed')
+  assert.equal(f.requests[0].prompt_cache_key, f.requests[1].prompt_cache_key)
+  assert.deepEqual(f.requests[1].input, [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'reply:first question' },
+    { role: 'user', content: 'follow up' },
+  ])
+  const timeline = (await f.messages()).data.messages
+  assert.deepEqual(timeline.map((m: { seq: number }) => m.seq), [1, 2, 3, 4])
+  assert.equal(JSON.stringify(timeline).includes('private reasoning'), false)
+})
+
+test('Responses rejects incomplete or refused output without adding an assistant message', async (t) => {
+  const f = await fixture(t, (_body, response) => responsesAnswer(response, 'partial must not be saved', 'incomplete'), undefined, 'responses')
+  const sent = await f.send('unfinished generation')
+  assert.equal((await f.execute(f.worker())).status, 'failed')
+  assert.equal((await f.run(sent.data.run.id)).data.run.status, 'failed')
+  assert.equal((await f.messages()).data.messages.length, 1)
+  const g = await fixture(t, (_body, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'completed', output: [
+      { type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'refusal', refusal: 'private refusal' }] },
+    ] }))
+  }, undefined, 'responses')
+  const refused = await g.send('refused generation')
+  assert.equal((await g.execute(g.worker())).status, 'failed')
+  assert.equal(JSON.stringify((await g.run(refused.data.run.id)).data.run).includes('private refusal'), false)
+  assert.equal((await g.messages()).data.messages.length, 1)
+})
+
+test('Responses rejects unfinished or missing message status even when the response is completed', async (t) => {
+  for (const status of ['incomplete', 'in_progress', undefined]) {
+    const f = await fixture(t, (_body, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'completed', output: [
+        { type: 'message', role: 'assistant', status, content: [{ type: 'output_text', text: 'partial must not be saved' }] },
+      ] }))
+    }, undefined, 'responses')
+    await f.send('unfinished message')
+    assert.equal((await f.execute(f.worker())).status, 'failed')
+    assert.equal((await f.messages()).data.messages.length, 1)
+  }
+})
+
+test('Responses cancellation aborts upstream HTTP without a late reply', async (t) => {
+  const started = deferred<void>()
+  const disconnected = deferred<void>()
+  const f = await fixture(t, (_body, response) => {
+    response.once('close', () => disconnected.resolve())
+    started.resolve()
+  }, undefined, 'responses')
+  const sent = await f.send('cancel responses')
+  const work = f.execute(f.worker())
+  await bounded(started.promise)
+  await f.cancel(sent.data.run.id)
+  await bounded(work)
+  await bounded(disconnected.promise)
+  assert.equal((await f.run(sent.data.run.id)).data.run.status, 'canceled')
+  assert.equal((await f.messages()).data.messages.length, 1)
 })

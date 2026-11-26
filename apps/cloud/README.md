@@ -22,6 +22,7 @@ node src/main.ts
 | --- | --- | --- |
 | `PORT` | `8787` | HTTP 监听端口 |
 | `DB_PATH` | `./data/cloud.sqlite` | SQLite 文件路径；父目录由服务创建 |
+| `POS_MODEL` | 未配置 | 可选公开型号标识，供 `/v2/health.model` 和手机展示；与 worker 加载同一份型号配置。不是模型端点、凭据或 worker 在线状态 |
 | `V2_ADMIN_SECRET` | 无，必填 | 配对用管理密钥，客户端请求头为 `x-pair-secret` |
 
 在 `apps/cloud` 下运行云端限定检查：

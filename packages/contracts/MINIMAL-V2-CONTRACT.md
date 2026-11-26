@@ -29,7 +29,7 @@
 
 ### 健康/配对
 
-- `GET /v2/health` → `200 {ok:true, service:"personal-os-cloud", protocolVersion:2, dbPath?:string}`。
+- `GET /v2/health` → `200 {ok:true, service:"personal-os-cloud", protocolVersion:2, dbPath?:string, model?:string}`。`model` 为 2026-11-26 手机型号显示需求增加的兼容可选元数据：当前 worker 配置的请求型号，不代表每条历史回复的上游实际型号，也不代表 worker 在线。未配置时省略，客户端须兼容缺省；不返回模型端点或凭据。
 - `POST /v2/pair` + `x-pair-secret` + `{name:string, role:"client"|"agent"}` → `201 {device:Device, token:string}`。
 - `GET /v2/me` → `200 {device:Device}`。
 - `Device` 至少含 `{id,name,role,createdAt,lastSeenAt,revokedAt}`；客户端只依赖 `id/name/role/createdAt`。

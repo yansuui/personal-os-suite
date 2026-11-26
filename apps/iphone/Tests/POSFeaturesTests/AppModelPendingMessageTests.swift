@@ -242,6 +242,124 @@ final class AppModelPendingMessageTests: XCTestCase {
     }
 
     @MainActor
+    func testRefreshTrimsUpdatesAndClearsServerModel() async throws {
+        let api = try PendingMessageAPI(healthModel: " \n model-first \t")
+        let (model, _) = try await makeModel(api: api)
+        defer { model.signOut() }
+        await model.setApplicationActive(false)
+        XCTAssertEqual(model.serverModel, "model-first")
+        XCTAssertEqual(model.modelDisplayName, "model-first")
+
+        for value in ["model-next", " \n\t", "model-restored", nil] as [String?] {
+            await api.setHealthModel(value)
+            await model.refresh()
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let expected = trimmed?.isEmpty == false ? trimmed : nil
+            XCTAssertEqual(model.serverModel, expected)
+            XCTAssertEqual(model.modelDisplayName, expected ?? "服务器未提供型号")
+        }
+    }
+
+    @MainActor
+    func testHealthFailureCannotPresentOldModelAsCurrentWhenChatReconnects() async throws {
+        let api = try PendingMessageAPI(healthModel: "model-first")
+        let (model, _) = try await makeModel(api: api)
+        defer { model.signOut() }
+        await model.setApplicationActive(false)
+        await api.setHealthFailure(.transport("offline"))
+        await model.refresh()
+        XCTAssertFalse(model.connection.isOnline)
+        XCTAssertEqual(model.serverModel, "model-first")
+        XCTAssertEqual(model.modelDisplayName, "model-first（上次连接）")
+
+        // 其他聊天请求成功不能代替健康检查，旧型号仍然只能作为上次连接信息。
+        await model.createConversation()
+        XCTAssertTrue(model.connection.isOnline)
+        XCTAssertEqual(model.modelDisplayName, "model-first（上次连接）")
+        await api.setHealthFailure(nil)
+        await api.setHealthModel("model-next")
+        await model.refresh()
+        XCTAssertEqual(model.modelDisplayName, "model-next")
+    }
+
+    @MainActor
+    func testHealthFailureWithoutKnownModelShowsNotProvided() async throws {
+        let api = try PendingMessageAPI(healthFailure: .transport("offline"), healthModel: "unverified-model")
+        let (model, _) = try await makeModel(api: api)
+        defer { model.signOut() }
+        XCTAssertFalse(model.connection.isOnline)
+        XCTAssertNil(model.serverModel)
+        XCTAssertEqual(model.modelDisplayName, "服务器未提供型号")
+    }
+
+    @MainActor
+    func testHealthModelWaitsForMeAndIsNotAppliedWhenMeFails() async throws {
+        let api = try PendingMessageAPI(healthModel: "model-first")
+        let (model, _) = try await makeModel(api: api)
+        defer { model.signOut() }
+        await model.setApplicationActive(false)
+        await api.setHealthModel("unverified-model")
+        await api.setMeFailure(.unauthorized)
+        await api.holdNextMe()
+        let refresh = Task { await model.refresh() }
+        await api.waitForSuspendedMe()
+        XCTAssertEqual(model.serverModel, "model-first", "me 通过前不能应用公开 health 的新型号")
+        XCTAssertEqual(model.modelDisplayName, "model-first（上次连接）")
+        await api.releaseMe()
+        await refresh.value
+        XCTAssertEqual(model.phase.failureMessage, "登录已失效，请重新配对")
+        XCTAssertEqual(model.serverModel, "model-first")
+        XCTAssertEqual(model.modelDisplayName, "model-first（上次连接）")
+    }
+
+    @MainActor
+    func testSignOutClearsModelAndDiscardsSuspendedHealth() async throws {
+        let api = try PendingMessageAPI(healthModel: "model-first")
+        let (model, _) = try await makeModel(api: api)
+        await model.setApplicationActive(false)
+        await api.setHealthModel("late-model")
+        await api.holdHealth()
+        let refresh = Task { await model.refresh() }
+        await api.waitForSuspendedHealth()
+        model.signOut()
+        XCTAssertNil(model.serverModel)
+        await api.releaseHealth()
+        await refresh.value
+        XCTAssertNil(model.serverModel)
+        XCTAssertEqual(model.modelDisplayName, "服务器未提供型号")
+        XCTAssertNil(model.session)
+        XCTAssertFalse(model.isRefreshing)
+    }
+
+    @MainActor
+    func testNewIdentityClearsModelAndDiscardsOldMeResponse() async throws {
+        let api = try PendingMessageAPI(healthModel: "old-model")
+        let (model, _) = try await makeModel(api: api)
+        defer { model.signOut() }
+        await model.setApplicationActive(false)
+        await api.setHealthModel("late-old-model")
+        await api.holdNextMe()
+        let oldRefresh = Task { await model.refresh() }
+        await api.waitForSuspendedMe()
+
+        let newSession = try JSONDecoder().decode(AuthSession.self, from: Data(#"{"token":"new-token","device":{"id":"new-device","name":"另一台 iPhone","role":"client","createdAt":"now"}}"#.utf8))
+        await api.setSession(newSession)
+        await api.setHealthModel("new-model")
+        await api.holdHealth()
+        let pair = Task { await model.pair(serverURL: URL(string: "https://new-stub.invalid")!, secret: "test-pair-secret", deviceName: "另一台 iPhone") }
+        await api.waitForSuspendedHealth()
+        XCTAssertNil(model.serverModel, "新身份开始配对时立即清除旧型号")
+        await api.releaseHealth()
+        await pair.value
+        XCTAssertEqual(model.session, newSession)
+        XCTAssertEqual(model.modelDisplayName, "new-model")
+        await api.releaseMe()
+        await oldRefresh.value
+        XCTAssertEqual(model.serverModel, "new-model", "旧身份的 me 迟到不能覆盖新身份型号")
+        XCTAssertEqual(model.modelDisplayName, "new-model")
+    }
+
+    @MainActor
     private func assertRestoredStatePreserved(_ model: AppModel, store: PendingSnapshotStore, credentials: PendingCredentialStore,
                                              file: StaticString = #filePath, line: UInt = #line) throws {
         let snapshot = store.initialSnapshot
@@ -313,11 +431,12 @@ private struct RecordedPendingSend: Sendable {
 }
 
 private actor PendingMessageAPI: POSAPI {
-    private let session: AuthSession
+    private var session: AuthSession
     private let conversation: Conversation
     private var sendFailures: [POSAPIError]
     private var healthFailure: POSAPIError?
-    private let meFailure: POSAPIError?
+    private var healthModel: String?
+    private var meFailure: POSAPIError?
     private var sends: [RecordedPendingSend] = []
     private var calls: [String] = []
     private var messagesToRead: [ChatMessage] = []
@@ -327,14 +446,18 @@ private actor PendingMessageAPI: POSAPI {
     private var shouldHoldHealth = false
     private var healthGate: CheckedContinuation<Void, Never>?
     private var healthWaiters: [CheckedContinuation<Void, Never>] = []
+    private var shouldHoldMe = false
+    private var meGate: CheckedContinuation<Void, Never>?
+    private var meWaiters: [CheckedContinuation<Void, Never>] = []
     private var businessObserver: (@Sendable () -> Void)?
 
     init(sendFailures: [POSAPIError] = [], healthFailure: POSAPIError? = nil, meFailure: POSAPIError? = nil,
-         commitBeforeSendFailure: Bool = false) throws {
+         commitBeforeSendFailure: Bool = false, healthModel: String? = nil) throws {
         session = try PendingValues.session()
         conversation = try PendingValues.conversation()
         self.sendFailures = sendFailures
         self.healthFailure = healthFailure
+        self.healthModel = healthModel
         self.meFailure = meFailure
         self.commitBeforeSendFailure = commitBeforeSendFailure
     }
@@ -342,8 +465,24 @@ private actor PendingMessageAPI: POSAPI {
     func recordedSends() -> [RecordedPendingSend] { sends }
     func recordedCalls() -> [String] { calls }
     func setMessages(_ messages: [ChatMessage]) { messagesToRead = messages }
-    func setHealthFailure(_ failure: POSAPIError) { healthFailure = failure }
+    func setHealthFailure(_ failure: POSAPIError?) { healthFailure = failure }
+    func setHealthModel(_ model: String?) { healthModel = model }
+    func setMeFailure(_ failure: POSAPIError?) { meFailure = failure }
+    func setSession(_ session: AuthSession) { self.session = session }
+    func holdNextMe() { shouldHoldMe = true }
+    func waitForSuspendedMe() async {
+        if meGate != nil { return }
+        await withCheckedContinuation { meWaiters.append($0) }
+    }
+    func releaseMe() {
+        meGate?.resume()
+        meGate = nil
+    }
     func holdHealth() { shouldHoldHealth = true }
+    func waitForSuspendedHealth() async {
+        if healthGate != nil { return }
+        await withCheckedContinuation { healthWaiters.append($0) }
+    }
     func healthIsSuspended() -> Bool { healthGate != nil }
     func observeBusinessRequests(_ observer: (@Sendable () -> Void)?) { businessObserver = observer }
     func waitForHealthRequested() async {
@@ -361,11 +500,20 @@ private actor PendingMessageAPI: POSAPI {
     }
     func health() async throws -> HealthResponse {
         record("health")
-        for waiter in healthWaiters { waiter.resume() }
-        healthWaiters.removeAll()
-        if shouldHoldHealth { await withCheckedContinuation { healthGate = $0 } }
+        if shouldHoldHealth {
+            await withCheckedContinuation { continuation in
+                healthGate = continuation
+                for waiter in healthWaiters { waiter.resume() }
+                healthWaiters.removeAll()
+            }
+        } else {
+            for waiter in healthWaiters { waiter.resume() }
+            healthWaiters.removeAll()
+        }
         if let healthFailure { throw healthFailure }
-        return try JSONDecoder().decode(HealthResponse.self, from: Data(#"{"ok":true,"service":"personal-os-cloud","protocolVersion":2}"#.utf8))
+        var body: [String: Any] = ["ok": true, "service": "personal-os-cloud", "protocolVersion": 2]
+        if let healthModel { body["model"] = healthModel }
+        return try JSONDecoder().decode(HealthResponse.self, from: JSONSerialization.data(withJSONObject: body))
     }
     func pair(secret: String, _ request: PairRequest) async throws -> AuthSession {
         record("pair")
@@ -373,8 +521,18 @@ private actor PendingMessageAPI: POSAPI {
     }
     func me(_ session: AuthSession) async throws -> DeviceInfo {
         record("me")
-        if let meFailure { throw meFailure }
-        return self.session.device
+        let device = self.session.device
+        let failure = meFailure
+        if shouldHoldMe {
+            shouldHoldMe = false
+            await withCheckedContinuation { continuation in
+                meGate = continuation
+                for waiter in meWaiters { waiter.resume() }
+                meWaiters.removeAll()
+            }
+        }
+        if let failure { throw failure }
+        return device
     }
     func createConversation(_ session: AuthSession, title: String?) async throws -> Conversation {
         record("createConversation")
