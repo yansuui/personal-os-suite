@@ -1,0 +1,682 @@
+openapi: 3.1.0
+info:
+  title: Cloud v2 conversation API
+  version: 0.1.0
+  description: |
+    Node.js 24 cloud service for one owner (ownerId is always default).
+    Device tokens are issued once by pairing. Client devices create conversations,
+    append user messages and poll messages; agent devices lease and complete runs.
+    Request bodies are limited to 1 MiB. Unknown body fields and unknown or
+    repeated query parameters return 400. Empty JSON bodies are invalid except
+    for lease and cancel. Model execution, push notifications, attachments and multi-user isolation are
+    outside this API. The existing v1 gateway remains available during migration.
+servers:
+  - url: http://127.0.0.1:8787
+    description: Local default; replace with the deployed service origin.
+security:
+  - bearerAuth: []
+tags:
+  - name: Identity
+  - name: Conversations
+  - name: Runs
+paths:
+  /v2/health:
+    get:
+      operationId: getHealth
+      tags: [Identity]
+      summary: Check service health and protocol version
+      security: []
+      responses:
+        '200':
+          description: Service is running. Secrets are never included.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/pair:
+    post:
+      operationId: pairDevice
+      tags: [Identity]
+      summary: Exchange the admin pairing secret for a device token
+      description: The token appears only in this response; the database stores its SHA-256 hash.
+      security:
+        - pairSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairRequest'
+      responses:
+        '201':
+          description: Device registered. Store the token securely; do not log it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/me:
+    get:
+      operationId: getCurrentDevice
+      tags: [Identity]
+      summary: Read the authenticated device
+      responses:
+        '200':
+          description: Current device, without its token hash.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/conversations:
+    post:
+      operationId: createConversation
+      tags: [Conversations]
+      summary: Create a conversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConversationRequest'
+      responses:
+        '201':
+          description: Conversation created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listConversations
+      tags: [Conversations]
+      summary: List conversations for the single owner
+      responses:
+        '200':
+          description: Conversations owned by default.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/conversations/{id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      operationId: listMessages
+      tags: [Conversations]
+      summary: Read messages after a conversation sequence, optionally long polling
+      description: |
+        Messages are ordered by seq. seq starts at 1 and increases within each
+        conversation. Existing messages return immediately. If no messages are
+        available, wait may hold the request for up to 25 seconds (fractions are
+        allowed). A timeout returns messages: [] and preserves the after cursor.
+        Successful completion with non-empty resultText appends an assistant
+        message; clients read that reply through this same endpoint.
+      parameters:
+        - name: after
+          in: query
+          description: Last seq already read; an inclusive cursor to skip.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 9007199254740991
+            default: 0
+        - name: wait
+          in: query
+          description: Maximum long-poll wait in seconds, including fractional seconds.
+          schema:
+            type: number
+            minimum: 0
+            maximum: 25
+            default: 0
+      responses:
+        '200':
+          description: Ordered messages and the last returned seq, or after when empty.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: appendUserMessage
+      tags: [Conversations]
+      summary: Append a user message and enqueue its run
+      description: |
+        (conversationId, clientRequestId) is unique. Replaying a request returns
+        the original message and run, even when the submitted text differs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMessageRequest'
+      responses:
+        '201':
+          description: New user message and queued run; created is true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedMessageResponse'
+        '200':
+          description: Idempotent replay; original message and run, created is false.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayedMessageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/runs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getRun
+      tags: [Runs]
+      summary: Read a run
+      responses:
+        '200':
+          description: Current run state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/runs/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      operationId: cancelRun
+      tags: [Runs]
+      summary: Cancel a queued or running run
+      description: Already terminal runs are returned unchanged, making cancellation idempotent.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Canceled run, or its existing terminal state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/runs/lease:
+    post:
+      operationId: leaseRun
+      tags: [Runs]
+      summary: Lease the next queued run (agent role required)
+      description: |
+        At most one run is leased globally at a time. A leased run is running.
+        Expired leases are requeued before further lease attempts. A client-role
+        device receives 403 even if its bearer token is valid.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaseRequest'
+      responses:
+        '200':
+          description: A running run and lease token, or both null when no work can be leased.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v2/runs/{id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      operationId: completeRun
+      tags: [Runs]
+      summary: Complete or fail a leased run (agent role required)
+      description: |
+        The lease token must match an unexpired running lease. An unknown run is
+        404; a stale token, expired lease, or terminal run is 409. Only completed
+        and failed are accepted here; use cancel for cancellation. Completing
+        with non-empty resultText appends one assistant message and advances the
+        conversation seq in the same transaction as the run update. Clients read
+        the assistant reply via the messages endpoint. Failed runs do not append
+        an assistant reply.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRequest'
+      responses:
+        '200':
+          description: Terminal run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Opaque device token issued once by POST /v2/pair.
+    pairSecret:
+      type: apiKey
+      in: header
+      name: x-pair-secret
+      description: Server V2_ADMIN_SECRET; required only for pairing.
+  parameters:
+    ConversationId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        pattern: "^[A-Za-z0-9_-]+$"
+      description: Conversation identifier.
+    RunId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        pattern: "^[A-Za-z0-9_-]+$"
+      description: Run identifier.
+  responses:
+    BadRequest:
+      description: Invalid JSON (invalid_json) or invalid body/query parameters (invalid_request).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid bearer token or pairing secret (unauthorized).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: An agent role is required for this operation (forbidden).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Conversation, run or route does not exist (not_found).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: The run cannot be completed with this lease (conflict).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body exceeds the server limit (payload_too_large).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected server or storage error (internal_error).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Health:
+      type: object
+      required: [ok, service, protocolVersion]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        service:
+          type: string
+          const: personal-os-cloud
+        protocolVersion:
+          type: integer
+          const: 2
+        dbPath:
+          type: string
+          description: Optional database path; never includes credentials.
+    DeviceRole:
+      type: string
+      enum: [client, agent]
+    Device:
+      type: object
+      required: [id, name, role, createdAt, lastSeenAt, revokedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          $ref: '#/components/schemas/DeviceRole'
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: [string, 'null']
+          format: date-time
+        revokedAt:
+          type: [string, 'null']
+          format: date-time
+      description: Public device record; tokenHash is never returned.
+    Conversation:
+      type: object
+      required: [id, ownerId, title, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        ownerId:
+          type: string
+          const: default
+        title:
+          type: [string, 'null']
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    Message:
+      type: object
+      required: [id, conversationId, role, text, clientRequestId, seq, createdAt]
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+        text:
+          type: string
+        clientRequestId:
+          type: [string, 'null']
+        seq:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    RunStatus:
+      type: string
+      enum: [queued, running, completed, failed, canceled]
+    Run:
+      type: object
+      required: [id, conversationId, messageId, status, leaseToken, leasedUntil, createdAt, startedAt, finishedAt, resultText, error]
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        messageId:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        leaseToken:
+          type: [string, 'null']
+          description: Active lease token, cleared when the lease ends.
+        leasedUntil:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        finishedAt:
+          type: [string, 'null']
+          format: date-time
+        resultText:
+          type: [string, 'null']
+        error:
+          type: [string, 'null']
+    PairRequest:
+      type: object
+      additionalProperties: false
+      required: [name, role]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          pattern: '\S'
+        role:
+          $ref: '#/components/schemas/DeviceRole'
+    PairResponse:
+      type: object
+      required: [device, token]
+      properties:
+        device:
+          $ref: '#/components/schemas/Device'
+        token:
+          type: string
+          minLength: 1
+          description: Issued once. Store securely and never log this response.
+    DeviceResponse:
+      type: object
+      required: [device]
+      properties:
+        device:
+          $ref: '#/components/schemas/Device'
+    CreateConversationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        title:
+          type: [string, 'null']
+    ConversationResponse:
+      type: object
+      required: [conversation]
+      properties:
+        conversation:
+          $ref: '#/components/schemas/Conversation'
+    ConversationsResponse:
+      type: object
+      required: [conversations]
+      properties:
+        conversations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Conversation'
+    CreateMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [clientRequestId, text]
+      properties:
+        clientRequestId:
+          type: string
+          minLength: 1
+          pattern: '\S'
+          description: Stable per-conversation idempotency key supplied by the client.
+        text:
+          type: string
+          minLength: 1
+          pattern: '\S'
+    CreatedMessageResponse:
+      type: object
+      required: [message, run, created]
+      properties:
+        message:
+          $ref: '#/components/schemas/Message'
+        run:
+          $ref: '#/components/schemas/Run'
+        created:
+          type: boolean
+          const: true
+    ReplayedMessageResponse:
+      type: object
+      required: [message, run, created]
+      properties:
+        message:
+          $ref: '#/components/schemas/Message'
+        run:
+          $ref: '#/components/schemas/Run'
+        created:
+          type: boolean
+          const: false
+    MessagesResponse:
+      type: object
+      required: [messages, nextCursor]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        nextCursor:
+          type: integer
+          minimum: 0
+          description: Last returned message seq, or the requested after cursor when empty.
+    RunResponse:
+      type: object
+      required: [run]
+      properties:
+        run:
+          $ref: '#/components/schemas/Run'
+    LeaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        leaseMs:
+          type: integer
+          minimum: 1
+          maximum: 86400000
+          default: 30000
+          description: Integer lease duration in milliseconds, from 1 ms to 24 hours.
+    LeaseResponse:
+      oneOf:
+        - type: object
+          required: [run, leaseToken]
+          properties:
+            run:
+              $ref: '#/components/schemas/Run'
+            leaseToken:
+              type: string
+              minLength: 1
+        - type: object
+          required: [run, leaseToken]
+          properties:
+            run:
+              type: 'null'
+            leaseToken:
+              type: 'null'
+    CompleteRequest:
+      type: object
+      additionalProperties: false
+      required: [leaseToken, status]
+      properties:
+        leaseToken:
+          type: string
+          minLength: 1
+          pattern: '\S'
+        status:
+          type: string
+          enum: [completed, failed]
+        resultText:
+          type: [string, 'null']
+          description: Non-empty text on completed runs is appended as an assistant message atomically.
+        error:
+          type: [string, 'null']
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, invalid_json, unauthorized, forbidden, not_found, conflict, payload_too_large, internal_error]
+            message:
+              type: string

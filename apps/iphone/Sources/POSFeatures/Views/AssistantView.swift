@@ -65,14 +65,16 @@ struct AssistantView: View {
     private var pendingMessages: some View {
         if !model.currentPendingMessages.isEmpty {
             VStack(alignment: .leading, spacing: POSTheme.Spacing.s) {
-                Text("待发送 / 结果未确认（重试保留原消息）")
+                Text("发送或运行回执待确认（重试沿用原消息）")
                     .font(.caption)
                 ForEach(model.currentPendingMessages) { pending in
                     HStack {
                         Text(pending.text).lineLimit(2)
                         Spacer()
-                        Button("重试") { Task { await model.retryPending(pending) } }
-                            .disabled(model.isSending)
+                        Button(model.messages.contains(where: { $0.role == "user" && $0.clientRequestID == pending.clientRequestID }) ? "恢复状态" : "重试") {
+                            Task { await model.retryPending(pending) }
+                        }
+                        .disabled(model.isSending)
                     }
                 }
             }
@@ -90,14 +92,19 @@ struct AssistantView: View {
                     if model.messages.isEmpty {
                         EmptyStateView(
                             title: "和助手聊聊",
-                            message: "消息会同步到桌面端；断网时也能看到本地缓存的历史。",
+                            message: "发送消息后可查看生成状态；断网时也能看到本地缓存的历史。",
                             systemImage: "bubble.left.and.bubble.right"
                         )
                     }
 
                     ForEach(model.messages) { message in
-                        MessageBubble(message: message)
-                            .id(message.id)
+                        VStack(alignment: .leading, spacing: POSTheme.Spacing.s) {
+                            MessageBubble(message: message)
+                            if let record = model.currentRunRecords.first(where: { $0.messageID == message.id }) {
+                                runStatus(record)
+                            }
+                        }
+                        .id(message.id)
                     }
 
                     Color.clear
@@ -116,6 +123,40 @@ struct AssistantView: View {
                 scrollToBottom(proxy, animated: true)
             }
         }
+    }
+
+    private func runStatus(_ record: RunRecord) -> some View {
+        VStack(alignment: .leading, spacing: POSTheme.Spacing.xs) {
+            HStack(spacing: POSTheme.Spacing.s) {
+                if !record.status.isTerminal {
+                    ProgressView().controlSize(.mini)
+                }
+                Text(record.status.title)
+                    .font(.caption)
+                    .foregroundStyle(record.status == .failed ? POSTheme.warning : POSTheme.secondaryText)
+                Spacer()
+                if !record.status.isTerminal {
+                    Button(model.cancelingRunIDs.contains(record.id) ? "取消中…" : "取消") {
+                        Task { await model.cancelRun(record.id) }
+                    }
+                    .disabled(model.cancelingRunIDs.contains(record.id))
+                    .font(.caption)
+                }
+            }
+            if record.status == .failed {
+                Text(record.serverError ?? "生成失败，请重新发送消息。")
+                    .font(.caption).foregroundStyle(POSTheme.warning)
+            }
+            if let error = record.cancellationError {
+                Text(error).font(.caption).foregroundStyle(POSTheme.warning)
+            }
+            if let error = record.pollingError, !record.status.isTerminal {
+                Text("状态暂未更新：" + error).font(.caption).foregroundStyle(POSTheme.warning)
+                Button("刷新状态") { Task { await model.refreshRunStates() } }.font(.caption)
+            }
+        }
+        .padding(.horizontal, POSTheme.Spacing.s)
+        .accessibilityElement(children: .contain)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {

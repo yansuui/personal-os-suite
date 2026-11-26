@@ -12,3 +12,9 @@ Payload/
 
 # 节点（云端/插件阶段会用到）
 node_modules/
+
+# 云端运行数据（含设备 token 哈希与聊天记录）
+/apps/cloud/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

@@ -9,4 +9,6 @@ public protocol POSAPI: Sendable {
     func conversations(_ session: AuthSession) async throws -> [Conversation]
     func messages(_ session: AuthSession, conversationID: String, after: Int, waitSeconds: Int) async throws -> MessagePage
     func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck
+    func run(_ session: AuthSession, runID: String) async throws -> Run
+    func cancelRun(_ session: AuthSession, runID: String) async throws -> Run
 }

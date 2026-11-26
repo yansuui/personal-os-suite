@@ -40,14 +40,16 @@ const method = (source, name, next) => {
 };
 
 check('HTTP routes match the frozen v2 client contract', () => {
-  const routes = [...new Set([...api.matchAll(/"(v\d+\/[^"\n]+)"/g)].map(match => '/' + match[1].replace('\\(conversationID)', ':conversationId')))];
-  assert.deepEqual(routes.sort(), ['/v2/health', '/v2/pair', '/v2/me', '/v2/conversations', '/v2/conversations/:conversationId/messages'].sort());
+  const routes = [...new Set([...api.matchAll(/"(v\d+\/[^"\n]+)"/g)].map(match => '/' + match[1].replace('\\(conversationID)', ':conversationId').replace('\\(runID)', ':runId')))];
+  // cancelRun composes the frozen path from the shared, validated runsPath helper.
+  if (api.includes('path: runsPath(runID) + "/cancel"')) routes.push('/v2/runs/:runId/cancel');
+  assert.deepEqual(routes.sort(), ['/v2/health', '/v2/pair', '/v2/me', '/v2/conversations', '/v2/conversations/:conversationId/messages', '/v2/runs/:runId', '/v2/runs/:runId/cancel'].sort());
   for (const route of routes) assert.ok(contract.includes(route), `route missing from contract: ${route}`);
   for (const file of sources) assert.ok(!/\bv1\//.test(fs.readFileSync(file, 'utf8')), `${file} still references v1`);
 });
 check('POSAPI only exposes supported client operations', () => {
   assert.deepEqual([...protocol.matchAll(/func (\w+)\(/g)].map(m => m[1]).sort(),
-    ['health', 'pair', 'me', 'createConversation', 'conversations', 'messages', 'sendMessage'].sort());
+    ['health', 'pair', 'me', 'createConversation', 'conversations', 'messages', 'sendMessage', 'run', 'cancelRun'].sort());
   assert.ok(!/api\.(tasks|approve|submitVerdict|context|presence|timeline)\(/.test(app + sync));
 });
 check('pair wire shape and credentials are isolated', () => {
@@ -154,7 +156,7 @@ check('focused XCTest sources cover contract and persistence regressions', () =>
     'testConflictMapsToConflictAndIsNotRetried']) assert.ok(testText.includes(`func ${name}(`), `missing ${name}`);
   assert.ok(!/\b(api\.(tasks|context|presence|timeline)\(|TimelinePage|TaskList)/.test(testText));
   let jsonFixtures = 0;
-  for (const raw of testText.matchAll(/#"(\{[^\n]*\})"#/g)) { JSON.parse(raw[1]); jsonFixtures++; }
+  for (const raw of testText.matchAll(/#"(\{[^\n]*?\})"#/g)) { JSON.parse(raw[1]); jsonFixtures++; }
   assert.ok(jsonFixtures >= 5);
   console.log(`INFO ${tests.length} XCTest source files, ${[...testText.matchAll(/func test\w+\(/g)].length} test methods, ${jsonFixtures} literal JSON fixtures parsed`);
 });

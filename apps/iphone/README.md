@@ -6,13 +6,15 @@ Windows 上写代码 → GitHub Actions 出无签名 IPA → Sideloadly 装到 i
 ## 1. 先说结论与限制
 
 - **本机（Windows）没有 Mac、没有 Swift 工具链**，不能本地 `xcodebuild`、不能跑 XcodeGen。
-  因此：**Swift 代码一律以 CI 为准，本轮 A 侧代码未经编译验收**。
+  因此：**Swift 编译与 XCTest 由 GitHub macOS CI 执行，每次交付以对应提交的构建记录为准**。
 - 本地能做的：改 Swift / 改工程配置 / 改 workflow、按 `CONTRACT.md` 自检接口。
 - 交付物是 **未签名 IPA**，安装时由 Sideloadly 用你自己的 Apple ID 重签。
 
 ## v2 最小聊天与本地验证
 
-- 只调用 v2：health、client 配对、me、创建/列出会话、按会话发送与增量读取消息；assistant 回复从云端消息流读取。
+- 只调用 v2：health、client 配对、me、创建/列出会话、按会话发送与增量读取消息、查询/取消运行；assistant 回复从云端消息流读取。
+- 发送回执中的运行按会话持久化，独立轮询排队/生成/完成/失败/取消状态；取消以服务器响应为准。切后台暂停轮询，回前台验证连接后恢复；终态停止查询。
+- 服务器已接受正文但运行回执丢失时，保留原请求键；点击“恢复状态”可幂等重放取得原运行并继续查询或取消，不创建第二条消息。v2 没有运行列表接口，其他设备的未知运行不能仅凭消息记录恢复。
 - 主界面仅“聊天 / 我的”，聊天页可创建/选择会话。任务、审批、验收、计划、记忆和 presence 未接入，“我的”页明确标注。
 - 待发消息在请求前写入快照，自动重试、手动重试、重启后重试复用同一个 `clientRequestId`。会话独立保存游标，空页不归零，发送 ack 不跳过尚未读取的消息。
 - 保留原 Keychain service/account、快照文件和身份目录。旧全局时间线与任务/上下文只保留在快照中，不混入 v2 会话；v2 离线首屏恢复选中会话的消息与待发项。
@@ -24,7 +26,7 @@ node --check scripts/validate-minimal-v2.cjs
 node scripts/validate-minimal-v2.cjs
 ```
 
-本轮结果：11 组静态检查通过；扫描 34 个 Swift 源文件，发现 31 个 XCTest 用例声明，解析了 11 个字面 JSON 夹具。**这些是源码静态检查；Swift 编译与 XCTest 未执行。** 测试覆盖和 macOS 定向命令见 `CONTRACT.md`。
+当前本地静态结果：12 组检查通过；扫描 34 个 Swift 源文件，发现 13 个 XCTest 源文件、65 个 test 方法声明，解析 25 个字面 JSON 夹具。**这些是源码静态检查；实际 Swift 编译与 XCTest 结果以当次 macOS CI 日志为准。**
 
 ## 2. 目录与职责
 
@@ -41,8 +43,8 @@ node scripts/validate-minimal-v2.cjs
 
 ## 3. 工程配置要点（`project.yml`）
 
-- 4 个 target：`POSCore`（framework）、`POSFeatures`（framework，链接 POSCore）、
-  `POSApp`（app，嵌入两个 framework）、`POSCoreTests`（`bundle.unit-test`，无 TEST_HOST）。
+- 5 个 target：`POSCore`（framework）、`POSFeatures`（framework，链接 POSCore）、
+  `POSApp`（app，嵌入两个 framework）、`POSCoreTests` 和 `POSFeaturesTests`（`bundle.unit-test`，无 TEST_HOST）。
 - 3 个 configuration：`Debug: debug`、`Staging: release`、`Release: release`，
   通过 `configFiles` 分别绑定 `Config/*.xcconfig`。
 - 平台：iOS 17.0、`TARGETED_DEVICE_FAMILY=1`（仅 iPhone）、`SWIFT_VERSION=5.0`、
@@ -52,7 +54,7 @@ node scripts/validate-minimal-v2.cjs
   `UILaunchScreen`、竖屏 `UISupportedInterfaceOrientations`、`POSServerURL=$(POS_SERVER_URL)`、
   以及 ATS 本地网络例外（`NSAllowsLocalNetworking` + `localhost` 例外域，
   `NSAllowsArbitraryLoads` 保持 `false`）。
-- scheme `POSApp`：build 含 `POSApp` + `POSCoreTests`，test 指向 `POSCoreTests`（Debug）。
+- scheme `POSApp`：build 含 `POSApp`、`POSCoreTests`、`POSFeaturesTests`，test 同时运行两组测试（Debug）。
 
 ### 服务器地址怎么改
 
@@ -125,7 +127,7 @@ POS_SERVER_URL = https:/$()/api.example.com      // 线上
 
 | 项 | 状态 |
 |---|---|
-| v2 静态契约检查 | `node scripts/validate-minimal-v2.cjs`：11 组通过；34 个 Swift 源文件，31 个 XCTest 声明，11 个字面 JSON 夹具 |
+| v2 静态契约检查 | `node scripts/validate-minimal-v2.cjs`：12 组通过；34 个 Swift 源文件、13 个 XCTest 源文件、65 个 test 方法声明、25 个字面 JSON 夹具 |
 | 验证脚本语法 | `node --check scripts/validate-minimal-v2.cjs`：通过 |
-| Swift 编译 / POSCoreTests 执行 | **未验证**（本机未找到 swift、swiftc、xcodebuild、xcodegen） |
-| 云构建 / IPA / iPhone 真机 | 本轮未触发构建、未生成或安装 IPA、未做真机运行 |
+| Swift 编译 / 两组 XCTest | 由对应提交的 `ios-ipa` macOS CI 实际执行；Windows 静态检查不能替代 |
+| IPA / iPhone 真机 | 对应提交、构建记录、IPA 和验包报告见当次交付记录；重签安装与真机运行另行验收 |

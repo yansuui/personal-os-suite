@@ -76,10 +76,42 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
         let ack = try decode(SendMessageAck.self, from: await send(urlRequest))
         guard ack.message.conversationID == conversationID,
               ack.message.clientRequestID == request.clientRequestID,
-              ack.run.conversationId == conversationID, ack.run.messageId == ack.message.id else {
-            throw POSAPIError.decoding("发送确认与会话或幂等键不匹配")
+              ack.run.conversationId == conversationID, ack.run.messageId == ack.message.id,
+              RunStatus(rawValue: ack.run.status) != nil,
+              ack.run.id.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else {
+            throw POSAPIError.decoding("发送确认与会话、运行状态或幂等键不匹配")
         }
         return ack
+    }
+
+    public func run(_ session: AuthSession, runID: String) async throws -> Run {
+        let request = try authorizedRequest(method: "GET", path: runsPath(runID), session: session)
+        let response = try decode(RunEnvelope.self, from: await send(request))
+        try validate(response.run, expectedID: runID)
+        return response.run
+    }
+
+    public func cancelRun(_ session: AuthSession, runID: String) async throws -> Run {
+        let request = try authorizedRequest(method: "POST", path: runsPath(runID) + "/cancel", session: session)
+        let response = try decode(RunEnvelope.self, from: await send(request))
+        try validate(response.run, expectedID: runID)
+        return response.run
+    }
+
+    private func runsPath(_ runID: String) throws -> String {
+        guard runID.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else {
+            throw POSAPIError.decoding("运行 ID 无效")
+        }
+        return "v2/runs/\(runID)"
+    }
+
+    private func validate(_ run: Run, expectedID: String) throws {
+        guard run.id == expectedID,
+              run.conversationId.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil,
+              run.messageId.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil,
+              RunStatus(rawValue: run.status) != nil else {
+            throw POSAPIError.decoding("运行响应与请求或 v2 状态不匹配")
+        }
     }
 
     private func messagesPath(_ conversationID: String) throws -> String {
@@ -166,6 +198,7 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
 private struct DeviceEnvelope: Decodable { let device: DeviceInfo }
 private struct ConversationEnvelope: Decodable { let conversation: Conversation }
 private struct ConversationsEnvelope: Decodable { let conversations: [Conversation] }
+private struct RunEnvelope: Decodable { let run: Run }
 private struct CreateConversationRequest: Encodable { let title: String? }
 private struct ErrorEnvelope: Decodable {
     struct Payload: Decodable { let code: String; let message: String }

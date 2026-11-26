@@ -93,6 +93,55 @@ public struct Run: Sendable, Codable, Equatable {
     public let conversationId: String
     public let messageId: String
     public let status: String
+    public let error: String?
+}
+
+public enum RunStatus: String, Sendable, Codable, CaseIterable {
+    case queued
+    case running
+    case completed
+    case failed
+    case canceled
+
+    public var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .canceled: return true
+        case .queued, .running: return false
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .queued: return "排队中"
+        case .running: return "生成中"
+        case .completed: return "已完成"
+        case .failed: return "运行失败"
+        case .canceled: return "已取消"
+        }
+    }
+}
+
+/// 只持久化 client 展示与恢复需要的字段，不包含 agent lease 信息。
+public struct RunRecord: Sendable, Codable, Equatable, Identifiable {
+    public var id: String { runID }
+    public let runID: String
+    public let conversationID: String
+    public let messageID: String
+    public var status: RunStatus
+    public var serverError: String?
+    public var pollingError: String?
+    public var cancellationError: String?
+
+    public init(runID: String, conversationID: String, messageID: String, status: RunStatus,
+                serverError: String? = nil, pollingError: String? = nil, cancellationError: String? = nil) {
+        self.runID = runID
+        self.conversationID = conversationID
+        self.messageID = messageID
+        self.status = status
+        self.serverError = serverError
+        self.pollingError = pollingError
+        self.cancellationError = cancellationError
+    }
 }
 
 public struct SendMessageAck: Sendable, Codable, Equatable {
@@ -201,16 +250,18 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
     public let selectedConversationID: String?
     public let conversationStates: [ConversationSnapshot]
     public let pendingMessages: [PendingMessage]
+    public let runRecords: [RunRecord]
 
     private enum CodingKeys: String, CodingKey {
         case savedAt, timeline, cursor, tasks, context
-        case conversations, selectedConversationID, conversationStates, pendingMessages
+        case conversations, selectedConversationID, conversationStates, pendingMessages, runRecords
     }
 
     public init(savedAt: String, timeline: [ChatMessage] = [], cursor: Int = 0,
                 tasks: [TaskSummary] = [], context: ContextSnapshot? = nil,
                 conversations: [Conversation] = [], selectedConversationID: String? = nil,
-                conversationStates: [ConversationSnapshot] = [], pendingMessages: [PendingMessage] = []) {
+                conversationStates: [ConversationSnapshot] = [], pendingMessages: [PendingMessage] = [],
+                runRecords: [RunRecord] = []) {
         self.savedAt = savedAt
         self.timeline = timeline
         self.cursor = cursor
@@ -220,6 +271,7 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
         self.selectedConversationID = selectedConversationID
         self.conversationStates = conversationStates
         self.pendingMessages = pendingMessages
+        self.runRecords = runRecords
     }
 
     public init(from decoder: Decoder) throws {
@@ -233,5 +285,6 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
         selectedConversationID = try values.decodeIfPresent(String.self, forKey: .selectedConversationID)
         conversationStates = try values.decodeIfPresent([ConversationSnapshot].self, forKey: .conversationStates) ?? []
         pendingMessages = try values.decodeIfPresent([PendingMessage].self, forKey: .pendingMessages) ?? []
+        runRecords = try values.decodeIfPresent([RunRecord].self, forKey: .runRecords) ?? []
     }
 }

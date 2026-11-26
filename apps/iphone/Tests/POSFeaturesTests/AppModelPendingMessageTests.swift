@@ -64,7 +64,8 @@ final class AppModelPendingMessageTests: XCTestCase {
         let systemOnly = PendingMessage(conversationID: conversationID, clientRequestID: "system-key", text: "继续", createdAt: "now")
         let pending = [confirmed, otherKey, otherConversation, assistantOnly, systemOnly]
         let api = try PendingMessageAPI()
-        let (model, store) = try await makeModel(api: api, pending: pending)
+        let knownRun = RunRecord(runID: "known-run", conversationID: conversationID, messageID: "server-user", status: .running)
+        let (model, store) = try await makeModel(api: api, pending: pending, runRecords: [knownRun])
         defer { model.signOut() }
         XCTAssertEqual(model.pendingMessages, pending)
 
@@ -89,6 +90,40 @@ final class AppModelPendingMessageTests: XCTestCase {
         XCTAssertEqual(saved.conversationStates.first { $0.conversationID == conversationID }?.cursor, 4)
         let sends = await api.recordedSends()
         XCTAssertTrue(sends.isEmpty, "同步确认不能额外发送消息")
+    }
+
+    @MainActor
+    func testLostAckKeepsRequestAcrossPollingAndRestartUntilRunIsRecovered() async throws {
+        let api = try PendingMessageAPI(sendFailures: [.transport("ack lost"), .transport("ack lost")], commitBeforeSendFailure: true)
+        let (model, store) = try await makeModel(api: api)
+        await model.send("保留运行回执恢复")
+        let pending = try XCTUnwrap(model.pendingMessages.first)
+        await model.refresh()
+        XCTAssertEqual(model.messages.count, 1, "服务端已接受正文")
+        XCTAssertEqual(model.pendingMessages, [pending], "仅确认正文时必须保留原请求键")
+        XCTAssertTrue(model.runRecords.isEmpty)
+        XCTAssertEqual(try store.loadSnapshot()?.pendingMessages, [pending])
+        model.signOut()
+
+        let restored = AppModel(serverURL: URL(string: "https://stub.invalid")!, api: api,
+            credentials: PendingCredentialStore(session: try PendingValues.session()), store: store)
+        defer { restored.signOut() }
+        await restored.bootstrap()
+        XCTAssertEqual(restored.pendingMessages, [pending])
+        await restored.retryPending(pending)
+        let sends = await api.recordedSends()
+        XCTAssertEqual(sends.count, 3)
+        XCTAssertTrue(sends.allSatisfy { $0.request == pending.request })
+        let acceptedCount = await api.acceptedMessageCount()
+        XCTAssertEqual(acceptedCount, 1, "恢复运行不能创建第二条服务端消息")
+        XCTAssertTrue(restored.pendingMessages.isEmpty)
+        XCTAssertEqual(restored.messages.count, 1)
+        let run = try XCTUnwrap(restored.runRecords.first)
+        XCTAssertEqual(run.runID, "run-\(pending.clientRequestID)")
+        XCTAssertEqual(run.messageID, restored.messages.first?.id)
+        await restored.cancelRun(run.runID)
+        XCTAssertEqual(restored.runRecords.first?.status, .canceled)
+        XCTAssertEqual(try store.loadSnapshot()?.runRecords.first?.status, .canceled)
     }
 
     @MainActor
@@ -223,10 +258,12 @@ final class AppModelPendingMessageTests: XCTestCase {
 
     @MainActor
     private func makeModel(api: PendingMessageAPI, pending: [PendingMessage] = [], cachedMessages: [ChatMessage] = [],
-                           credentials: PendingCredentialStore? = nil, expectsReady: Bool = true) async throws -> (AppModel, PendingSnapshotStore) {
+                           credentials: PendingCredentialStore? = nil, expectsReady: Bool = true,
+                           runRecords: [RunRecord] = []) async throws -> (AppModel, PendingSnapshotStore) {
         let conversation = try PendingValues.conversation()
         let snapshot = CachedSnapshot(savedAt: "2026-01-01T00:00:00Z", conversations: [conversation], selectedConversationID: conversation.id,
-            conversationStates: [ConversationSnapshot(conversationID: conversation.id, messages: cachedMessages, cursor: cachedMessages.last?.seq ?? 0)], pendingMessages: pending)
+            conversationStates: [ConversationSnapshot(conversationID: conversation.id, messages: cachedMessages, cursor: cachedMessages.last?.seq ?? 0)],
+            pendingMessages: pending, runRecords: runRecords)
         let restored = try JSONDecoder().decode(CachedSnapshot.self, from: JSONEncoder().encode(snapshot))
         let store = PendingSnapshotStore(snapshot: restored)
         let credentialStore: PendingCredentialStore
@@ -284,18 +321,24 @@ private actor PendingMessageAPI: POSAPI {
     private var sends: [RecordedPendingSend] = []
     private var calls: [String] = []
     private var messagesToRead: [ChatMessage] = []
+    private var knownRuns: [String: Run] = [:]
+    private var acceptedMessages: [String: SendMessageAck] = [:]
+    private let commitBeforeSendFailure: Bool
     private var shouldHoldHealth = false
     private var healthGate: CheckedContinuation<Void, Never>?
     private var healthWaiters: [CheckedContinuation<Void, Never>] = []
     private var businessObserver: (@Sendable () -> Void)?
 
-    init(sendFailures: [POSAPIError] = [], healthFailure: POSAPIError? = nil, meFailure: POSAPIError? = nil) throws {
+    init(sendFailures: [POSAPIError] = [], healthFailure: POSAPIError? = nil, meFailure: POSAPIError? = nil,
+         commitBeforeSendFailure: Bool = false) throws {
         session = try PendingValues.session()
         conversation = try PendingValues.conversation()
         self.sendFailures = sendFailures
         self.healthFailure = healthFailure
         self.meFailure = meFailure
+        self.commitBeforeSendFailure = commitBeforeSendFailure
     }
+    func acceptedMessageCount() -> Int { acceptedMessages.count }
     func recordedSends() -> [RecordedPendingSend] { sends }
     func recordedCalls() -> [String] { calls }
     func setMessages(_ messages: [ChatMessage]) { messagesToRead = messages }
@@ -353,8 +396,29 @@ private actor PendingMessageAPI: POSAPI {
     func sendMessage(_ session: AuthSession, conversationID: String, _ request: SendMessageRequest) async throws -> SendMessageAck {
         record("sendMessage")
         sends.append(RecordedPendingSend(conversationID: conversationID, request: request))
+        let key = conversationID + "/" + request.clientRequestID
+        let ack = try acceptedMessages[key] ?? PendingValues.ack(conversationID: conversationID, request: request, seq: acceptedMessages.count + 1)
+        if commitBeforeSendFailure {
+            acceptedMessages[key] = ack
+            knownRuns[ack.run.id] = ack.run
+            if !messagesToRead.contains(where: { $0.id == ack.message.id }) { messagesToRead.append(ack.message) }
+        }
         if !sendFailures.isEmpty { throw sendFailures.removeFirst() }
-        return try PendingValues.ack(conversationID: conversationID, request: request, seq: sends.count)
+        acceptedMessages[key] = ack
+        knownRuns[ack.run.id] = ack.run
+        return ack
+    }
+    func run(_ session: AuthSession, runID: String) async throws -> Run {
+        guard let run = knownRuns[runID] else { throw POSAPIError.server(status: 404, code: "not_found", message: "Run not found") }
+        return run
+    }
+    func cancelRun(_ session: AuthSession, runID: String) async throws -> Run {
+        let previous = try await run(session, runID: runID)
+        let data = try JSONSerialization.data(withJSONObject: ["id": previous.id, "conversationId": previous.conversationId,
+            "messageId": previous.messageId, "status": "canceled"])
+        let canceled = try JSONDecoder().decode(Run.self, from: data)
+        knownRuns[runID] = canceled
+        return canceled
     }
 }
 

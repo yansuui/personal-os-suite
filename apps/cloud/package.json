@@ -1,0 +1,21 @@
+{
+  "name": "@personal-os/cloud",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.28.5",
+  "type": "module",
+  "description": "Personal OS 云端会话服务（v2）：会话、消息、运行队列",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "worker": "node src/worker/main.ts",
+    "test": "node --test test/api.test.ts test/store.test.ts test/integration.test.ts test/contract-e2e.test.ts test/worker.test.ts test/worker-e2e.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

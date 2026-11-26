@@ -3,6 +3,7 @@ import SwiftUI
 /// v2 仅展示聊天与设备信息；任务、计划、记忆和审批尚未接入。
 public struct RootView: View {
     @ObservedObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     public init(model: AppModel) {
         _model = ObservedObject(wrappedValue: model)
@@ -15,6 +16,9 @@ public struct RootView: View {
         }
         .tint(POSTheme.accent)
         .task { await model.bootstrap() }
+        .onChange(of: scenePhase) { _, phase in
+            Task { await model.setApplicationActive(phase == .active) }
+        }
     }
 }
 

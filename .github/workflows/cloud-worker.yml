@@ -1,0 +1,42 @@
+name: cloud-worker
+
+on:
+  push:
+    paths:
+      - 'apps/cloud/**'
+      - '.github/workflows/cloud-worker.yml'
+  pull_request:
+    paths:
+      - 'apps/cloud/**'
+      - '.github/workflows/cloud-worker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/cloud
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned package manager
+        run: npm install --global pnpm@11.28.5 --ignore-scripts
+      - name: Install locked development dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Typecheck cloud and worker
+        run: pnpm typecheck
+      - name: Test API, SQLite, and worker with local model HTTP
+        run: pnpm test

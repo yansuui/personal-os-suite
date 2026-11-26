@@ -10,6 +10,8 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var conversations: [Conversation] = []
     @Published public private(set) var selectedConversationID: String?
     @Published public private(set) var pendingMessages: [PendingMessage] = []
+    @Published public private(set) var runRecords: [RunRecord] = []
+    @Published public private(set) var cancelingRunIDs: Set<String> = []
     @Published public private(set) var lastSyncedAt: Date?
     @Published public private(set) var connection: ConnectionState = .unknown
     @Published public private(set) var serverURL: URL
@@ -40,6 +42,9 @@ public final class AppModel: ObservableObject {
     private var syncEngine: SyncEngine?
     private var syncTask: Task<Void, Never>?
     private var syncGeneration = 0
+    private var runPollingTask: Task<Void, Never>?
+    private var runPollingGeneration = 0
+    private var isApplicationActive = true
     private var identityGeneration = 0
     private var hasBootstrapped = false
     private var hasValidatedServer = false
@@ -63,6 +68,9 @@ public final class AppModel: ObservableObject {
     public var currentPendingMessages: [PendingMessage] {
         pendingMessages.filter { $0.conversationID == selectedConversationID }
     }
+    public var currentRunRecords: [RunRecord] {
+        runRecords.filter { $0.conversationID == selectedConversationID }
+    }
 
     public func bootstrap() async {
         guard !hasBootstrapped else { return }
@@ -77,7 +85,10 @@ public final class AppModel: ObservableObject {
             hydrateFromSnapshot()
             phase = .ready
             await refresh()
-            if phase.isReady { startSync() }
+            if phase.isReady {
+                startSync()
+                startRunPolling()
+            }
         } catch {
             notice = "读取本机配对凭据失败，请重新配对"
         }
@@ -98,6 +109,8 @@ public final class AppModel: ObservableObject {
         identityGeneration += 1
         let generation = identityGeneration
         stopSync()
+        stopRunPolling()
+        cancelingRunIDs = []
         isRefreshing = false
         isSending = false
         isCreatingConversation = false
@@ -121,7 +134,10 @@ public final class AppModel: ObservableObject {
             hydrateFromSnapshot()
             phase = .ready
             await refresh()
-            if phase.isReady { startSync() }
+            if phase.isReady {
+                startSync()
+                startRunPolling()
+            }
         } catch {
             guard generation == identityGeneration else { return }
             let detail = POSCoreBridge.pairFailureMessage(error: error)
@@ -129,12 +145,14 @@ public final class AppModel: ObservableObject {
                 phase = .ready
                 notice = detail
                 startSync()
+                startRunPolling()
             } else { phase = .failed(detail) }
         }
     }
 
     public func signOut() {
         stopSync()
+        stopRunPolling()
         identityGeneration += 1
         do { try credentials.clear(); notice = nil }
         catch { notice = "本机凭据清除失败" }
@@ -156,6 +174,8 @@ public final class AppModel: ObservableObject {
         conversations = []
         selectedConversationID = nil
         pendingMessages = []
+        runRecords = []
+        cancelingRunIDs = []
         conversationStates = [:]
         restoredSnapshot = nil
         cursor = 0
@@ -172,7 +192,14 @@ public final class AppModel: ObservableObject {
         guard phase.isReady, !isRefreshing, let api, let session else { return }
         let generation = identityGeneration
         isRefreshing = true
-        defer { if generation == identityGeneration { isRefreshing = false } }
+        defer {
+            if generation == identityGeneration {
+                isRefreshing = false
+                // 回前台时可能仍在等待这次刷新；结束后补回被后台暂停的轮询。
+                if syncTask == nil { startSync() }
+                if runPollingTask == nil { startRunPolling() }
+            }
+        }
         do {
             _ = try await api.health()
             guard generation == identityGeneration else { return }
@@ -232,20 +259,37 @@ public final class AppModel: ObservableObject {
         guard conversations.contains(where: { $0.id == id }), selectedConversationID != id else { return }
         saveCurrentConversation()
         stopSync()
+        stopRunPolling()
         selectedConversationID = id
         messages = conversationStates[id]?.messages ?? []
         cursor = conversationStates[id]?.cursor ?? 0
         draft = ""
         persistSnapshot()
         startSync()
+        startRunPolling()
     }
 
     public func reconnect() async {
         guard phase.isReady, !isRefreshing else { return }
         connection = .unknown
         stopSync()
+        stopRunPolling()
         await refresh()
-        if phase.isReady { startSync() }
+        if phase.isReady {
+            startSync()
+            startRunPolling()
+        }
+    }
+
+    /// 暂停本机轮询不会取消云端运行；回到前台重新验证连接并恢复已知运行。
+    public func setApplicationActive(_ active: Bool) async {
+        isApplicationActive = active
+        if active {
+            await reconnect()
+        } else {
+            stopSync()
+            stopRunPolling()
+        }
     }
 
     /// 先保存待发消息，再提交。失败不生成新键，重启后仍可明确重试。
@@ -280,13 +324,15 @@ public final class AppModel: ObservableObject {
             do {
                 let ack = try await api.sendMessage(session, conversationID: pending.conversationID, pending.request)
                 guard generation == identityGeneration else { return }
-                // apply 同时根据服务端 user 消息确认本会话的待发项。
+                // 同时保存消息和运行回执，保留确认丢失时恢复运行所需的原键。
+                try recordRun(ack.run)
                 apply([ack.message], to: pending.conversationID)
                 // ack 的 seq 可能跨过未读取的 assistant 消息，不能用 ack 推进 polling cursor。
                 connection = .online
                 lastSyncedAt = Date()
                 notice = nil
                 persistSnapshot()
+                startRunPolling()
                 return
             } catch {
                 guard generation == identityGeneration else { return }
@@ -306,6 +352,106 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// 只查询本机保存过回执的运行；冻结 v2 没有按会话列出运行的接口。
+    public func refreshRunStates() async {
+        guard phase.isReady, hasValidatedServer, isApplicationActive,
+              let api, let session, let conversationID = selectedConversationID else { return }
+        let identity = identityGeneration
+        let generation = runPollingGeneration
+        let active = currentRunRecords.filter { !$0.status.isTerminal }
+        for record in active {
+            guard !Task.isCancelled, identity == identityGeneration, generation == runPollingGeneration,
+                  selectedConversationID == conversationID, isApplicationActive else { return }
+            do {
+                let run = try await api.run(session, runID: record.runID)
+                guard !Task.isCancelled, identity == identityGeneration, generation == runPollingGeneration,
+                      selectedConversationID == conversationID, isApplicationActive else { return }
+                try recordRun(run, expected: record)
+            } catch {
+                guard !Task.isCancelled, identity == identityGeneration, generation == runPollingGeneration,
+                      selectedConversationID == conversationID, isApplicationActive else { return }
+                if let index = runRecords.firstIndex(where: { $0.id == record.id && !$0.status.isTerminal }) {
+                    runRecords[index].pollingError = POSCoreBridge.message(for: POSCoreBridge.apiError(from: error))
+                }
+                if case .unauthorized = POSCoreBridge.apiError(from: error) {
+                    handle(error)
+                    persistSnapshot()
+                    return
+                }
+            }
+            persistSnapshot()
+        }
+    }
+
+    public func cancelRun(_ runID: String) async {
+        guard phase.isReady, hasValidatedServer, isApplicationActive, let api, let session,
+              let record = runRecords.first(where: { $0.id == runID && $0.conversationID == selectedConversationID }),
+              !record.status.isTerminal, !cancelingRunIDs.contains(runID) else { return }
+        let identity = identityGeneration
+        cancelingRunIDs.insert(runID)
+        defer { if identity == identityGeneration { cancelingRunIDs.remove(runID) } }
+        do {
+            let run = try await api.cancelRun(session, runID: runID)
+            guard identity == identityGeneration else { return }
+            guard RunStatus(rawValue: run.status)?.isTerminal == true else {
+                throw POSAPIError.decoding("取消响应尚未进入终态")
+            }
+            try recordRun(run, expected: record)
+        } catch {
+            guard identity == identityGeneration else { return }
+            if let index = runRecords.firstIndex(where: { $0.id == runID && !$0.status.isTerminal }) {
+                runRecords[index].cancellationError = "取消结果未确认：" + POSCoreBridge.message(for: POSCoreBridge.apiError(from: error))
+            }
+            if case .unauthorized = POSCoreBridge.apiError(from: error) { handle(error) }
+        }
+        persistSnapshot()
+        startRunPolling()
+    }
+
+    private func recordRun(_ run: Run, expected: RunRecord? = nil) throws {
+        guard let status = RunStatus(rawValue: run.status),
+              expected == nil || (run.id == expected?.runID && run.conversationId == expected?.conversationID && run.messageId == expected?.messageID) else {
+            throw POSAPIError.decoding("运行响应与会话或状态不匹配")
+        }
+        if let index = runRecords.firstIndex(where: { $0.id == run.id }) {
+            guard runRecords[index].conversationID == run.conversationId, runRecords[index].messageID == run.messageId else {
+                throw POSAPIError.decoding("运行响应与已保存的消息不匹配")
+            }
+            // 取消与轮询可并发，终态不能被迟到的 running/queued 响应覆盖。
+            guard !runRecords[index].status.isTerminal else { return }
+            runRecords[index].status = status
+            runRecords[index].serverError = run.error
+            runRecords[index].pollingError = nil
+            if status.isTerminal { runRecords[index].cancellationError = nil }
+        } else {
+            runRecords.append(RunRecord(runID: run.id, conversationID: run.conversationId,
+                messageID: run.messageId, status: status, serverError: run.error))
+        }
+    }
+
+    private func startRunPolling() {
+        stopRunPolling()
+        guard phase.isReady, hasValidatedServer, isApplicationActive, let id = selectedConversationID,
+              currentRunRecords.contains(where: { !$0.status.isTerminal }) else { return }
+        let generation = runPollingGeneration
+        runPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.runPollingGeneration == generation,
+                      self.selectedConversationID == id, self.isApplicationActive else { return }
+                await self.refreshRunStates()
+                guard self.currentRunRecords.contains(where: { !$0.status.isTerminal }) else { return }
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) }
+                catch { return }
+            }
+        }
+    }
+
+    private func stopRunPolling() {
+        runPollingGeneration += 1
+        runPollingTask?.cancel()
+        runPollingTask = nil
+    }
+
     // 旧功能没有 v2 路由，调用时也只报告未接入，绝不伪造成功。
     public func approve(taskID: String) async { notice = "任务审批未接入 v2" }
     public func reject(taskID: String, note: String?) async { notice = "任务审批未接入 v2" }
@@ -321,10 +467,12 @@ public final class AppModel: ObservableObject {
         case .unauthorized:
             hasValidatedServer = false
             stopSync()
+            stopRunPolling()
             phase = .failed("登录已失效，请重新配对")
         case .server(_, "v2_unavailable", let detail):
             hasValidatedServer = false
             stopSync()
+            stopRunPolling()
             phase = .failed(detail)
         case .conflict:
             needsRefresh = true
@@ -334,7 +482,7 @@ public final class AppModel: ObservableObject {
 
     private func startSync() {
         stopSync()
-        guard phase.isReady, hasValidatedServer, let api, let session, let id = selectedConversationID else { return }
+        guard phase.isReady, hasValidatedServer, isApplicationActive, let api, let session, let id = selectedConversationID else { return }
         let generation = syncGeneration
         let engine = SyncEngine(api: api, session: session, conversationID: id, store: snapshotStore(), waitSeconds: 20)
         syncEngine = engine
@@ -372,6 +520,7 @@ public final class AppModel: ObservableObject {
     private func apply(_ incoming: [ChatMessage], to id: String) {
         let confirmedRequestIDs = Set(incoming.compactMap { message -> String? in
             guard message.conversationID == id, message.role == "user" else { return nil }
+            guard runRecords.contains(where: { $0.conversationID == id && $0.messageID == message.id }) else { return nil }
             return message.clientRequestID
         })
         pendingMessages.removeAll {
@@ -419,6 +568,7 @@ public final class AppModel: ObservableObject {
         conversations = snapshot.conversations
         selectedConversationID = snapshot.selectedConversationID
         pendingMessages = snapshot.pendingMessages
+        runRecords = snapshot.runRecords
         conversationStates = Dictionary(snapshot.conversationStates.map { ($0.conversationID, $0) },
                                         uniquingKeysWith: { _, newer in newer })
         if let id = selectedConversationID {
@@ -436,7 +586,7 @@ public final class AppModel: ObservableObject {
             tasks: restoredSnapshot?.tasks ?? [], context: restoredSnapshot?.context,
             conversations: conversations, selectedConversationID: selectedConversationID,
             conversationStates: conversationStates.values.sorted { $0.conversationID < $1.conversationID },
-            pendingMessages: pendingMessages)
+            pendingMessages: pendingMessages, runRecords: runRecords)
         do { try snapshotStore().saveSnapshot(snapshot); return true }
         catch { notice = "本地快照保存失败，请检查存储空间后重试"; return false }
     }
