@@ -178,7 +178,7 @@ final class AppModelRunTests: XCTestCase {
 
     // Keep actor reads outside XCTest's synchronous autoclosures.
     private func assertActorValue<T: Equatable>(_ value: T, _ expected: T, file: StaticString = #filePath, line: UInt = #line) {
-        XCTest.XCTAssertEqual(value, expected, file: file, line: line)
+        XCTAssertEqual(value, expected, file: file, line: line)
     }
 }
 
