@@ -2,7 +2,7 @@ import Foundation
 import Combine
 import POSCore
 
-/// v2 最小聊天状态；凭据与离线数据仍由 POSCore 存储。
+/// v2 聊天与可选目标状态；凭据与离线数据由 POSCore 存储。
 @MainActor
 public final class AppModel: ObservableObject {
     @Published public private(set) var phase: AppPhase = .signedOut
@@ -24,6 +24,25 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var needsRefresh = false
     @Published public private(set) var notice: String?
     @Published public var draft = ""
+    @Published public private(set) var goals: [Goal] = []
+    @Published public private(set) var goalDetails: [String: GoalDetail] = [:]
+    @Published public private(set) var goalsCapabilities: POSCapabilities?
+    @Published public private(set) var goalsError: String?
+    @Published public private(set) var isLoadingGoals = false
+    @Published public private(set) var loadingGoalIDs: Set<String> = []
+    @Published public private(set) var isCreatingGoal = false
+    @Published public private(set) var pendingGoalActions: Set<String> = []
+    @Published public private(set) var conversationGoalIDs: [String: String] = [:]
+    @Published public private(set) var goalTaskDetails: [String: GoalTaskDetail] = [:]
+    @Published public private(set) var goalDrafts: [String: GoalDraft] = [:]
+    @Published public private(set) var goalDraftStorageError: String?
+    @Published public private(set) var goalContexts: [String: GoalQuestionContext] = [:]
+    @Published public private(set) var goalContextErrors: [String: String] = [:]
+    @Published public private(set) var loadingGoalContextIDs: Set<String> = []
+    @Published public private(set) var loadingGoalTaskIDs: Set<String> = []
+    @Published public private(set) var goalsLastSyncedAt: String?
+    @Published public private(set) var goalsOnline = false
+    @Published public var selectedTab = 0
 
     // 仅让未展示的旧页面继续编译。v2 不读取或显示旧任务/上下文。
     public let tasks: [TaskSummary] = []
@@ -38,6 +57,13 @@ public final class AppModel: ObservableObject {
     private let injectedStore: (any SnapshotStore)?
     private var store: (any SnapshotStore)?
     private var conversationStates: [String: ConversationSnapshot] = [:]
+    private var goalDetailGenerations: [String: Int] = [:]
+    private var goalTaskGenerations: [String: Int] = [:]
+    private var goalsPollingTask: Task<Void, Never>?
+    private var goalsPollingGeneration = 0
+    private var goalsTabActive = false
+    private var visibleGoalID: String?
+    private var visibleGoalTaskID: String?
     /// 升级前的全局时间线/任务/上下文保留在快照中，不混入任何 v2 会话。
     private var restoredSnapshot: CachedSnapshot?
     private var cursor = 0
@@ -77,6 +103,17 @@ public final class AppModel: ObservableObject {
     }
     public var currentRunRecords: [RunRecord] {
         runRecords.filter { $0.conversationID == selectedConversationID }
+    }
+
+    public var canEditGoals: Bool {
+        phase.isReady && hasValidatedServer && connection.isOnline && goalsOnline && goalsCapabilities?.supportsGoals == true
+    }
+    public var cacheIdentityKey: String { "\(serverURL.absoluteString)|\(session?.device.id ?? "")" }
+    public var associatedGoalID: String? { selectedConversationID.flatMap { conversationGoalIDs[$0] } }
+    public var supportsGoalQuestions: Bool { goalsCapabilities?.supportsGoalQuestions == true }
+    public var associatedGoal: Goal? {
+        guard let conversationID = selectedConversationID, let goalID = conversationGoalIDs[conversationID] else { return nil }
+        return goals.first { $0.id == goalID } ?? goalDetails[goalID]?.goal
     }
 
     public func bootstrap() async {
@@ -123,6 +160,7 @@ public final class AppModel: ObservableObject {
         isRefreshing = false
         isSending = false
         isCreatingConversation = false
+        resetGoalRequests()
         phase = .pairing
         notice = nil
         do {
@@ -162,6 +200,7 @@ public final class AppModel: ObservableObject {
     public func signOut() {
         stopSync()
         stopRunPolling()
+        stopGoalsPolling()
         identityGeneration += 1
         do { try credentials.clear(); notice = nil }
         catch { notice = "本机凭据清除失败" }
@@ -188,6 +227,19 @@ public final class AppModel: ObservableObject {
         runRecords = []
         cancelingRunIDs = []
         conversationStates = [:]
+        goals = []
+        goalDetails = [:]
+        goalTaskDetails = [:]
+        goalDrafts = [:]
+        goalDraftStorageError = nil
+        goalContexts = [:]
+        goalsLastSyncedAt = nil
+        goalsTabActive = false
+        visibleGoalID = nil
+        visibleGoalTaskID = nil
+        selectedTab = 0
+        conversationGoalIDs = [:]
+        resetGoalRequests()
         restoredSnapshot = nil
         cursor = 0
         draft = ""
@@ -210,6 +262,7 @@ public final class AppModel: ObservableObject {
                 // 回前台时可能仍在等待这次刷新；结束后补回被后台暂停的轮询。
                 if syncTask == nil { startSync() }
                 if runPollingTask == nil { startRunPolling() }
+                if goalsPollingTask == nil { startGoalsPolling() }
             }
         }
         do {
@@ -218,7 +271,7 @@ public final class AppModel: ObservableObject {
             hasValidatedServer = true
             let device = try await api.me(session)
             guard generation == identityGeneration else { return }
-            guard device.role == "client" else { throw POSAPIError.unauthorized }
+            guard device.role == "client", device.id == session.device.id else { throw POSAPIError.unauthorized }
             let model = health.model?.trimmingCharacters(in: .whitespacesAndNewlines)
             serverModel = model?.isEmpty == false ? model : nil
             let list = try await api.conversations(session)
@@ -302,7 +355,10 @@ public final class AppModel: ObservableObject {
         isApplicationActive = active
         if active {
             await reconnect()
+            await refreshVisibleGoals()
+            startGoalsPolling()
         } else {
+            stopGoalsPolling()
             stopSync()
             stopRunPolling()
         }
@@ -315,7 +371,7 @@ public final class AppModel: ObservableObject {
         guard let id = selectedConversationID else { notice = "请先创建或选择会话"; draft = text; return }
         guard api != nil, session != nil else { notice = "缺少网络实现，暂时无法发送"; draft = text; return }
         // 普通发送表示新的用户意图；只有明确重试才复用已有请求键。
-        let pending = PendingMessage(conversationID: id, text: text, createdAt: POSDate.isoString(Date()))
+        let pending = PendingMessage(conversationID: id, text: text, createdAt: POSDate.isoString(Date()), goalID: conversationGoalIDs[id])
         pendingMessages.append(pending)
         guard persistSnapshot() else {
             pendingMessages.removeAll { $0.id == pending.id }
@@ -336,9 +392,23 @@ public final class AppModel: ObservableObject {
         let generation = identityGeneration
         isSending = true
         defer { if generation == identityGeneration { isSending = false } }
+        if pending.goalID != nil {
+            if goalsCapabilities == nil { await refreshGoals() }
+            guard generation == identityGeneration else { return }
+            guard supportsGoalQuestions else {
+                notice = "当前服务器未启用目标问答；已保留原目标与待发消息，恢复能力后可重试"
+                return
+            }
+        }
         for attempt in 0..<2 {
             do {
-                let ack = try await api.sendMessage(session, conversationID: pending.conversationID, pending.request)
+                let ack: SendMessageAck
+                if let goalID = pending.goalID {
+                    ack = try await api.askGoal(session, goalID: goalID, GoalQuestionRequest(
+                        conversationID: pending.conversationID, clientRequestID: pending.clientRequestID, text: pending.text))
+                } else {
+                    ack = try await api.sendMessage(session, conversationID: pending.conversationID, pending.request)
+                }
                 guard generation == identityGeneration else { return }
                 // 同时保存消息和运行回执，保留确认丢失时恢复运行所需的原键。
                 try recordRun(ack.run)
@@ -349,6 +419,7 @@ public final class AppModel: ObservableObject {
                 notice = nil
                 persistSnapshot()
                 startRunPolling()
+                if pending.goalID != nil { await loadGoalContext(ack.run.id) }
                 return
             } catch {
                 guard generation == identityGeneration else { return }
@@ -433,7 +504,11 @@ public final class AppModel: ObservableObject {
             guard runRecords[index].conversationID == run.conversationId, runRecords[index].messageID == run.messageId else {
                 throw POSAPIError.decoding("运行响应与已保存的消息不匹配")
             }
+            guard runRecords[index].goalID == nil || runRecords[index].goalID == run.goalId else {
+                throw POSAPIError.decoding("运行的目标关联与原回执不匹配")
+            }
             // 取消与轮询可并发，终态不能被迟到的 running/queued 响应覆盖。
+            if let goalID = run.goalId { runRecords[index].goalID = goalID }
             guard !runRecords[index].status.isTerminal else { return }
             runRecords[index].status = status
             runRecords[index].serverError = run.error
@@ -441,7 +516,7 @@ public final class AppModel: ObservableObject {
             if status.isTerminal { runRecords[index].cancellationError = nil }
         } else {
             runRecords.append(RunRecord(runID: run.id, conversationID: run.conversationId,
-                messageID: run.messageId, status: status, serverError: run.error))
+                messageID: run.messageId, status: status, serverError: run.error, goalID: run.goalId))
         }
     }
 
@@ -468,6 +543,376 @@ public final class AppModel: ObservableObject {
         runPollingTask = nil
     }
 
+    // MARK: - v2 目标、持久命令草稿与固定问答依据
+
+    public func refreshGoals() async {
+        guard phase.isReady, hasValidatedServer, !isLoadingGoals, let api, let session else { return }
+        let identity = identityGeneration
+        isLoadingGoals = true
+        goalsError = nil
+        defer { if identity == identityGeneration { isLoadingGoals = false } }
+        do {
+            let capabilities = try await api.capabilities(session)
+            guard identity == identityGeneration else { return }
+            goalsCapabilities = capabilities
+            guard capabilities.supportsGoals else {
+                goalsOnline = false
+                goalsError = "当前服务器尚未提供目标能力；已有缓存仍可查看。"
+                return
+            }
+            async let active = api.goals(session, status: .active)
+            async let completed = api.goals(session, status: .completed)
+            async let archived = api.goals(session, status: .archived)
+            let lists = try await (active, completed, archived)
+            guard identity == identityGeneration else { return }
+            for goal in lists.0 + lists.1 + lists.2 { mergeGoal(goal) }
+            goalsOnline = true
+            goalsLastSyncedAt = POSDate.isoString(Date())
+            persistSnapshot()
+        } catch {
+            guard identity == identityGeneration else { return }
+            if case .server(404, _, _) = POSCoreBridge.apiError(from: error) { goalsCapabilities = POSCapabilities() }
+            handleGoalError(error)
+        }
+    }
+
+    public func loadGoal(_ id: String, force: Bool = false) async {
+        let identity = identityGeneration
+        if goalsCapabilities == nil { await refreshGoals() }
+        guard identity == identityGeneration, phase.isReady, hasValidatedServer,
+              goalsCapabilities?.supportsGoals == true, (force || !loadingGoalIDs.contains(id)), let api, let session else { return }
+        let requestGeneration = (goalDetailGenerations[id] ?? 0) + 1
+        goalDetailGenerations[id] = requestGeneration
+        loadingGoalIDs.insert(id)
+        defer {
+            if identity == identityGeneration, goalDetailGenerations[id] == requestGeneration { loadingGoalIDs.remove(id) }
+        }
+        do {
+            let detail = try await api.goal(session, goalID: id)
+            guard identity == identityGeneration, goalDetailGenerations[id] == requestGeneration else { return }
+            if let cached = goalDetails[id], cached.viewRevision > detail.viewRevision { return }
+            goalDetails[id] = detail
+            mergeGoal(detail.goal)
+            goalsOnline = true
+            persistSnapshot()
+        } catch {
+            guard identity == identityGeneration, goalDetailGenerations[id] == requestGeneration else { return }
+            handleGoalError(error)
+        }
+    }
+
+    public func loadGoalTask(_ id: String, force: Bool = false) async {
+        guard phase.isReady, hasValidatedServer, goalsCapabilities?.supportsGoals == true,
+              (force || !loadingGoalTaskIDs.contains(id)), let api, let session else { return }
+        let identity = identityGeneration
+        let requestGeneration = (goalTaskGenerations[id] ?? 0) + 1
+        goalTaskGenerations[id] = requestGeneration
+        loadingGoalTaskIDs.insert(id)
+        defer {
+            if identity == identityGeneration, goalTaskGenerations[id] == requestGeneration { loadingGoalTaskIDs.remove(id) }
+        }
+        do {
+            let detail = try await api.goalTask(session, taskID: id)
+            guard identity == identityGeneration, goalTaskGenerations[id] == requestGeneration else { return }
+            if let cached = goalTaskDetails[id], cached.task.revision > detail.task.revision { return }
+            goalTaskDetails[id] = detail
+            goalsOnline = true
+            persistSnapshot()
+        } catch {
+            guard identity == identityGeneration, goalTaskGenerations[id] == requestGeneration else { return }
+            handleGoalError(error)
+        }
+    }
+
+    /// 一个表单入口只有一个草稿槽；关闭、离线和重启均保留，不会悄悄替换在途命令。
+    @discardableResult
+    public func beginGoalDraft(_ proposal: GoalDraft) -> String {
+        guard phase.isReady else { return proposal.id }
+        if goalDrafts[proposal.id] == nil {
+            goalDrafts[proposal.id] = proposal
+            persistSnapshot()
+        }
+        return proposal.id
+    }
+
+    public func updateGoalDraft(_ draft: GoalDraft, identity: String) {
+        guard identity == cacheIdentityKey, phase.isReady, let saved = goalDrafts[draft.id],
+              !saved.isLocked, !isGoalDraftSaving(draft.id), saved.kind == draft.kind,
+              saved.goalID == draft.goalID, saved.taskID == draft.taskID else { return }
+        goalDrafts[draft.id] = draft
+        persistSnapshot()
+    }
+
+    /// 本机重试只写原子快照，不产生云端请求；成功后当前所有草稿才算已保留。
+    @discardableResult
+    public func persistGoalDraftsLocally(identity: String) -> Bool {
+        guard identity == cacheIdentityKey, phase.isReady else { return false }
+        return persistSnapshot()
+    }
+
+    public func isGoalDraftSaving(_ id: String) -> Bool {
+        guard let draft = goalDrafts[id] else { return false }
+        return pendingGoalActions.contains(draft.goalID ?? draft.id)
+    }
+
+    public func discardGoalDraft(_ id: String, identity: String) {
+        guard identity == cacheIdentityKey, let draft = goalDrafts[id],
+              !draft.hasUncertainResult, !isGoalDraftSaving(id) else { return }
+        goalDrafts[id] = nil
+        persistSnapshot()
+    }
+
+    /// 仅在服务器明确拒绝后，经用户点击才用新版本生成新命令；保留表单输入。
+    public func reviseGoalDraft(_ id: String, identity: String) async {
+        guard identity == cacheIdentityKey, let saved = goalDrafts[id],
+              saved.state == .conflict || saved.state == .rejected else { return }
+        let generation = identityGeneration
+        if let goalID = saved.goalID {
+            await loadGoal(goalID, force: true)
+            guard generation == identityGeneration else { return }
+        }
+        if let taskID = saved.taskID {
+            await loadGoalTask(taskID, force: true)
+            guard generation == identityGeneration else { return }
+        }
+        guard generation == identityGeneration, canEditGoals, var draft = goalDrafts[id], draft == saved else { return }
+        if let taskID = draft.taskID {
+            guard let latest = goalTaskDetails[taskID]?.task else { return }
+            draft.expectedRevision = latest.revision
+        } else if let goalID = draft.goalID {
+            guard let latest = goals.first(where: { $0.id == goalID }) ?? goalDetails[goalID]?.goal else { return }
+            draft.expectedRevision = latest.revision
+        }
+        draft.mutation = nil
+        draft.state = .editing
+        draft.error = nil
+        goalDrafts[id] = draft
+        persistSnapshot()
+    }
+
+    @discardableResult
+    public func submitGoalDraft(_ id: String, identity: String) async -> Bool {
+        guard identity == cacheIdentityKey, var draft = goalDrafts[id], !isGoalDraftSaving(id),
+              canEditGoals, draft.state != .conflict, draft.state != .rejected, let api, let session else { return false }
+        // 不允许同一目标存在第二个未确定结果的命令。
+        guard !goalDrafts.values.contains(where: { $0.id != id && $0.goalID == draft.goalID && $0.hasUncertainResult }) else {
+            goalsError = "请先恢复此目标中保存结果待确认的草稿"
+            return false
+        }
+        guard let mutation = draft.mutation ?? draft.makeMutation() else { return false }
+        draft.mutation = mutation
+        draft.state = .sending
+        draft.error = nil
+        goalDrafts[id] = draft
+        guard persistSnapshot() else {
+            draft.state = .unconfirmed
+            draft.error = "本机未能保存原操作，尚未发送；请检查存储空间后恢复保存"
+            goalDrafts[id] = draft
+            return false
+        }
+        let generation = identityGeneration
+        let busyKey = draft.goalID ?? draft.id
+        pendingGoalActions.insert(busyKey)
+        defer { if generation == identityGeneration { pendingGoalActions.remove(busyKey) } }
+        do {
+            var refreshedGoalID = draft.goalID
+            switch mutation {
+            case .createGoal(let request):
+                let goal = try await api.createGoal(session, request)
+                guard generation == identityGeneration else { return false }
+                mergeGoal(goal)
+                refreshedGoalID = goal.id
+            case .goal(let goalID, let command):
+                let goal = try await api.updateGoal(session, goalID: goalID, command)
+                guard generation == identityGeneration else { return false }
+                mergeGoal(goal)
+            case .createTask(let goalID, let request):
+                let task = try await api.createGoalTask(session, goalID: goalID, request)
+                guard generation == identityGeneration else { return false }
+                guard task.goalId == goalID else { throw POSAPIError.decoding("任务响应与目标不匹配") }
+            case .task(let taskID, let goalID, let command):
+                let task = try await api.updateGoalTask(session, taskID: taskID, command)
+                guard generation == identityGeneration else { return false }
+                guard task.goalId == goalID else { throw POSAPIError.decoding("任务响应与目标不匹配") }
+            }
+            guard generation == identityGeneration else { return false }
+            goalDrafts[id] = nil
+            goalsError = nil
+            persistSnapshot()
+            if let goalID = refreshedGoalID {
+                await loadGoal(goalID, force: true)
+                guard generation == identityGeneration else { return false }
+            }
+            if let taskID = draft.taskID {
+                await loadGoalTask(taskID, force: true)
+                guard generation == identityGeneration else { return false }
+            }
+            await refreshGoals()
+            guard generation == identityGeneration else { return false }
+            return true
+        } catch {
+            guard generation == identityGeneration else { return false }
+            let failure = POSCoreBridge.apiError(from: error)
+            switch failure {
+            case .conflict:
+                draft.state = .conflict
+                draft.error = "内容已更新；本地输入已保留。请核对服务器最新内容，再明确选择继续编辑。"
+            case .unauthorized:
+                draft.state = .rejected
+                draft.error = "登录已失效；草稿已保留，重新配对后再处理。"
+            case .server(let status, _, _) where (400..<500).contains(status) && status != 408 && status != 429:
+                draft.state = .rejected
+                draft.error = POSCoreBridge.message(for: failure)
+            default:
+                draft.state = .unconfirmed
+                draft.error = "保存结果未确认；已保留原操作与输入，请恢复保存以查询或重试同一次操作。"
+            }
+            goalDrafts[id] = draft
+            persistSnapshot()
+            handleGoalError(error)
+            if draft.state == .conflict {
+                let message = goalsError
+                if let goalID = draft.goalID {
+                    await loadGoal(goalID, force: true)
+                    guard generation == identityGeneration else { return false }
+                }
+                if let taskID = draft.taskID {
+                    await loadGoalTask(taskID, force: true)
+                    guard generation == identityGeneration else { return false }
+                }
+                goalsError = message
+            }
+            return false
+        }
+    }
+
+    public func associateCurrentConversation(with goalID: String?) {
+        guard let id = selectedConversationID else { return }
+        if let goalID {
+            guard supportsGoalQuestions, goals.contains(where: { $0.id == goalID }) || goalDetails[goalID] != nil else { return }
+        }
+        conversationGoalIDs[id] = goalID
+        persistSnapshot()
+    }
+
+    public func chatAboutGoal(_ goalID: String) async {
+        guard supportsGoalQuestions else { return }
+        let identity = identityGeneration
+        if selectedConversationID == nil { await createConversation() }
+        guard identity == identityGeneration, selectedConversationID != nil else { return }
+        associateCurrentConversation(with: goalID)
+        selectedTab = 0
+    }
+
+    public func loadGoalContext(_ runID: String) async {
+        guard goalContexts[runID] == nil, !loadingGoalContextIDs.contains(runID), phase.isReady,
+              hasValidatedServer, let record = runRecords.first(where: { $0.id == runID }),
+              let goalID = record.goalID, let api, let session else { return }
+        let identity = identityGeneration
+        loadingGoalContextIDs.insert(runID)
+        goalContextErrors[runID] = nil
+        defer { if identity == identityGeneration { loadingGoalContextIDs.remove(runID) } }
+        do {
+            guard let context = try await api.goalContext(session, runID: runID) else {
+                throw POSAPIError.decoding("本次回答没有可读取的目标资料快照")
+            }
+            guard identity == identityGeneration else { return }
+            guard context.runId == runID, context.goalId == goalID else { throw POSAPIError.decoding("回答依据与原目标不匹配") }
+            goalContexts[runID] = context
+            persistSnapshot()
+        } catch {
+            guard identity == identityGeneration else { return }
+            goalContextErrors[runID] = "本次依据尚未读到：" + POSCoreBridge.message(for: POSCoreBridge.apiError(from: error))
+            if case .unauthorized = POSCoreBridge.apiError(from: error) { handle(error) }
+        }
+    }
+
+    public func setGoalsTabActive(_ active: Bool) {
+        goalsTabActive = active
+        startGoalsPolling()
+    }
+    public func setVisibleGoal(_ id: String?) { visibleGoalID = id; startGoalsPolling() }
+    public func setVisibleGoalTask(_ id: String?) { visibleGoalTaskID = id; startGoalsPolling() }
+    public func dismissGoalsError() { goalsError = nil }
+
+    private func refreshVisibleGoals() async {
+        guard isApplicationActive, !Task.isCancelled,
+              goalsTabActive || visibleGoalID != nil || visibleGoalTaskID != nil else { return }
+        let generation = identityGeneration
+        await refreshGoals()
+        guard generation == identityGeneration, isApplicationActive, !Task.isCancelled else { return }
+        if let id = visibleGoalID { await loadGoal(id) }
+        guard generation == identityGeneration, isApplicationActive, !Task.isCancelled else { return }
+        if let id = visibleGoalTaskID { await loadGoalTask(id) }
+    }
+
+    private func startGoalsPolling() {
+        stopGoalsPolling()
+        guard phase.isReady, hasValidatedServer, isApplicationActive,
+              goalsTabActive || visibleGoalID != nil || visibleGoalTaskID != nil else { return }
+        let generation = goalsPollingGeneration
+        goalsPollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                guard let self, generation == self.goalsPollingGeneration, self.isApplicationActive else { return }
+                await self.refreshVisibleGoals()
+            }
+        }
+    }
+
+    private func stopGoalsPolling() {
+        goalsPollingGeneration += 1
+        goalsPollingTask?.cancel()
+        goalsPollingTask = nil
+    }
+
+    private func mergeGoal(_ goal: Goal) {
+        if let index = goals.firstIndex(where: { $0.id == goal.id }) {
+            let saved = goals[index]
+            guard saved.revision <= goal.revision else { return }
+            if saved.revision == goal.revision, (saved.viewRevision ?? 0) > (goal.viewRevision ?? 0) { return }
+            goals[index] = goal
+        } else { goals.append(goal) }
+        goals.sort { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
+    }
+
+    private func handleGoalError(_ error: Error) {
+        let failure = POSCoreBridge.apiError(from: error)
+        switch failure {
+        case .unauthorized:
+            goalsOnline = false
+            handle(failure)
+            goalsError = POSCoreBridge.message(for: failure)
+        case .transport:
+            goalsOnline = false
+            goalsError = "离线 · 已保留缓存与草稿，连接恢复后再次保存。"
+        case .server(404, _, _), .server(501, _, _):
+            goalsOnline = false
+            goalsError = "目标接口暂不可用；已有缓存仍可查看，请刷新重试。"
+        case .conflict:
+            goalsError = "内容已更新；已保留本地草稿，请核对服务器最新内容。"
+        default:
+            goalsOnline = false
+            goalsError = POSCoreBridge.message(for: failure)
+        }
+    }
+
+    private func resetGoalRequests() {
+        stopGoalsPolling()
+        goalsCapabilities = nil
+        goalsError = nil
+        goalsOnline = false
+        isLoadingGoals = false
+        loadingGoalIDs = []
+        loadingGoalTaskIDs = []
+        loadingGoalContextIDs = []
+        goalContextErrors = [:]
+        isCreatingGoal = false
+        pendingGoalActions = []
+        goalDetailGenerations = [:]
+        goalTaskGenerations = [:]
+    }
+
     // 旧功能没有 v2 路由，调用时也只报告未接入，绝不伪造成功。
     public func approve(taskID: String) async { notice = "任务审批未接入 v2" }
     public func reject(taskID: String, note: String?) async { notice = "任务审批未接入 v2" }
@@ -485,11 +930,13 @@ public final class AppModel: ObservableObject {
             hasValidatedServer = false
             stopSync()
             stopRunPolling()
+            stopGoalsPolling()
             phase = .failed("登录已失效，请重新配对")
         case .server(_, "v2_unavailable", let detail):
             hasValidatedServer = false
             stopSync()
             stopRunPolling()
+            stopGoalsPolling()
             phase = .failed(detail)
         case .conflict:
             needsRefresh = true
@@ -570,7 +1017,7 @@ public final class AppModel: ObservableObject {
         if let store { return store }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let identity = "\(serverURL.absoluteString)|\(session?.device.id ?? "")"
+        let identity = cacheIdentityKey
         let directory = base.appendingPathComponent("com.personalos.ios", isDirectory: true)
             .appendingPathComponent("snapshots", isDirectory: true)
             .appendingPathComponent(POSCoreBridge.stableDigest(identity), isDirectory: true)
@@ -581,11 +1028,23 @@ public final class AppModel: ObservableObject {
 
     private func hydrateFromSnapshot() {
         guard let snapshot = try? snapshotStore().loadSnapshot() else { return }
+        guard snapshot.identityKey == nil || snapshot.identityKey == cacheIdentityKey else { return }
         restoredSnapshot = snapshot
         conversations = snapshot.conversations
         selectedConversationID = snapshot.selectedConversationID
         pendingMessages = snapshot.pendingMessages
         runRecords = snapshot.runRecords
+        goals = snapshot.goals
+        goalDetails = Dictionary(snapshot.goalDetails.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
+        conversationGoalIDs = snapshot.conversationGoalIDs
+        goalsLastSyncedAt = snapshot.goalCache.lastSyncedAt
+        goalTaskDetails = Dictionary(snapshot.goalCache.taskDetails.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
+        goalContexts = Dictionary(snapshot.goalCache.contexts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        goalDrafts = Dictionary(snapshot.goalCache.drafts.map { saved in
+            var draft = saved
+            if draft.state == .sending { draft.state = .unconfirmed }
+            return (draft.id, draft)
+        }, uniquingKeysWith: { _, newer in newer })
         conversationStates = Dictionary(snapshot.conversationStates.map { ($0.conversationID, $0) },
                                         uniquingKeysWith: { _, newer in newer })
         if let id = selectedConversationID {
@@ -603,8 +1062,21 @@ public final class AppModel: ObservableObject {
             tasks: restoredSnapshot?.tasks ?? [], context: restoredSnapshot?.context,
             conversations: conversations, selectedConversationID: selectedConversationID,
             conversationStates: conversationStates.values.sorted { $0.conversationID < $1.conversationID },
-            pendingMessages: pendingMessages, runRecords: runRecords)
-        do { try snapshotStore().saveSnapshot(snapshot); return true }
-        catch { notice = "本地快照保存失败，请检查存储空间后重试"; return false }
+            pendingMessages: pendingMessages, runRecords: runRecords,
+            goals: goals, goalDetails: goalDetails.values.sorted { $0.id < $1.id },
+            conversationGoalIDs: conversationGoalIDs, identityKey: cacheIdentityKey,
+            goalCache: GoalCache(lastSyncedAt: goalsLastSyncedAt,
+                taskDetails: goalTaskDetails.values.sorted { $0.id < $1.id },
+                drafts: goalDrafts.values.sorted { $0.id < $1.id },
+                contexts: goalContexts.values.sorted { $0.id < $1.id }))
+        do {
+            try snapshotStore().saveSnapshot(snapshot)
+            goalDraftStorageError = nil
+            return true
+        } catch {
+            notice = "本地快照保存失败，请检查存储空间后重试"
+            goalDraftStorageError = "最新更改尚未保存到本机，重启应用后可能丢失。请检查存储空间并重试本机保存。"
+            return false
+        }
     }
 }

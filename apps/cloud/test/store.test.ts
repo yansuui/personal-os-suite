@@ -126,7 +126,7 @@ test('append atomically stores one user message and its queued run', t => {
   assert.deepEqual(result.run, {
     id: result.run.id, conversationId: conversation.id, messageId: result.message.id,
     status: 'queued', leaseToken: null, leasedUntil: null, createdAt: now(),
-    startedAt: null, finishedAt: null, resultText: null, error: null,
+    startedAt: null, finishedAt: null, resultText: null, error: null, goalId: null,
   })
   assert.deepEqual(store.listMessages(conversation.id, 0), [result.message])
   assert.deepEqual(store.getRun(result.run.id), result.run)
@@ -425,6 +425,113 @@ test('invalid lease durations and terminal inputs do not change queued or runnin
   assert.ok(store.completeRun(original.run.id, lease.leaseToken, { status: 'completed' }))
 })
 
+test('goal-question snapshot is durable and remains fixed after business data changes', t => {
+  const { open, advance } = fileFixture(t)
+  const first = open()
+  const device = first.pairDevice({ name: 'client', role: 'client', tokenHash: 'snapshot-client' })
+  const goal = first.createGoal({ deviceId: device.id, commandId: 'snapshot-goal', title: 'Snapshot goal' })
+  const task = first.createTask(goal.value.id, { deviceId: device.id, commandId: 'snapshot-task', title: 'Original task' })!
+  const conversation = first.createConversation({})
+  const question = first.appendUserMessage({
+    conversationId: conversation.id, role: 'user', clientRequestId: 'snapshot-question',
+    text: 'What remains?', goalId: goal.value.id,
+  })
+  const snapshot = first.goalContextForRun(question.run.id)!
+  assert.equal(snapshot.includedTasks[0].task.title, 'Original task')
+  assert.equal(snapshot.summary.todoTasks, 1)
+  advance(100)
+  first.updateTask(task.value.id, {
+    deviceId: device.id, commandId: 'snapshot-progress', expectedRevision: 1,
+    action: 'set_status', status: 'blocked', note: 'Waiting',
+  })
+  assert.deepEqual(first.goalContextForRun(question.run.id), snapshot)
+  first.close()
+
+  const reopened = open()
+  assert.deepEqual(reopened.goalContextForRun(question.run.id), snapshot)
+  assert.equal(reopened.getTask(task.value.id)?.task.status, 'blocked')
+  assert.deepEqual(reopened.appendUserMessage({
+    conversationId: conversation.id, role: 'user', clientRequestId: 'snapshot-question',
+    text: 'What remains?', goalId: goal.value.id,
+  }), { ...question, created: false })
+  assert.throws(() => reopened.appendUserMessage({
+    conversationId: conversation.id, role: 'user', clientRequestId: 'snapshot-question',
+    text: 'What remains?',
+  }), { code: 'goal_question_conflict' })
+})
+
+
+test('legacy run schemas migrate without losing ordinary records or lease behavior', t => {
+  const { open, dbPath } = fileFixture(t)
+  const initial = open()
+  const device = initial.pairDevice({ name: 'legacy client', role: 'client', tokenHash: 'legacy hash' })
+  const conversation = initial.createConversation({ title: 'legacy conversation' })
+  const original = append(initial, conversation.id, 'legacy-request')
+  initial.close()
+
+  const legacy = new DatabaseSync(dbPath)
+  try {
+    legacy.exec(`ALTER TABLE runs DROP COLUMN goal_id;
+      DROP TABLE goal_contexts;
+      DROP TABLE progress_entries;
+      DROP TABLE tasks;
+      DROP TABLE goals;
+      DROP TABLE command_receipts;`)
+    assert.ok(!legacy.prepare('PRAGMA table_info(runs)').all().some(row => row.name === 'goal_id'))
+  } finally {
+    legacy.close()
+  }
+
+  const migrated = open()
+  assert.deepEqual(migrated.deviceByTokenHash('legacy hash'), device)
+  assert.deepEqual(migrated.getConversation(conversation.id), conversation)
+  assert.deepEqual(migrated.listMessages(conversation.id, 0), [original.message])
+  assert.deepEqual(migrated.getRun(original.run.id), original.run)
+  assert.deepEqual(append(migrated, conversation.id, 'legacy-request'), { ...original, created: false })
+  assert.deepEqual(migrated.listGoals(), { goals: [], nextCursor: null })
+  const lease = migrated.leaseRun({ leaseMs: 1_000 })!
+  assert.equal(lease.run.id, original.run.id)
+  assert.equal(lease.run.goalId, null)
+  const goal = migrated.createGoal({ deviceId: device.id, commandId: 'post-migration-goal', title: 'New capability' })
+  migrated.close()
+  const reopened = open()
+  assert.deepEqual(reopened.getRun(original.run.id), lease.run)
+  assert.equal(reopened.getGoalView(goal.value.id)?.goal.title, 'New capability')
+})
+
+test('migration backfills goal markers before an old worker can lease goal questions', t => {
+  const { open, dbPath } = fileFixture(t)
+  const initial = open()
+  const device = initial.pairDevice({ name: 'client', role: 'client', tokenHash: 'migration goal hash' })
+  const goal = initial.createGoal({ deviceId: device.id, commandId: 'migration-goal', title: 'Preserved goal' })
+  initial.createTask(goal.value.id, { deviceId: device.id, commandId: 'migration-task', title: 'Preserved task' })
+  const conversation = initial.createConversation({})
+  const question = initial.appendUserMessage({
+    conversationId: conversation.id, role: 'user', text: 'What remains?',
+    clientRequestId: 'migration-question', goalId: goal.value.id,
+  })
+  const ordinary = append(initial, conversation.id, 'migration-ordinary')
+  const snapshot = initial.goalContextForRun(question.run.id)
+  initial.close()
+  const legacy = new DatabaseSync(dbPath)
+  try {
+    legacy.exec('ALTER TABLE runs DROP COLUMN goal_id')
+    assert.ok(!legacy.prepare('PRAGMA table_info(runs)').all().some(row => row.name === 'goal_id'))
+  } finally {
+    legacy.close()
+  }
+
+  const migrated = open()
+  assert.equal(migrated.getRun(question.run.id)?.goalId, goal.value.id)
+  assert.deepEqual(migrated.goalContextForRun(question.run.id), snapshot)
+  assert.equal(migrated.leaseRun({ leaseMs: 1_000 })?.run.id, ordinary.run.id)
+  migrated.cancelRun(ordinary.run.id)
+  assert.equal(migrated.leaseRun({ leaseMs: 1_000 }), null)
+  assert.equal(migrated.leaseRun({ leaseMs: 1_000, goalQuestionsVersion: 1 })?.run.id, question.run.id)
+  migrated.close()
+  assert.deepEqual(open().goalContextForRun(question.run.id), snapshot)
+})
+
 test('file databases create parent directories, use WAL and retain their schema and records on reopen', t => {
   const { open, dbPath, advance } = fileFixture(t)
   assert.equal(existsSync(dirname(dbPath)), false)
@@ -447,7 +554,7 @@ test('file databases create parent directories, use WAL and retain their schema 
     assert.equal(inspection.prepare('PRAGMA journal_mode').get()?.journal_mode, 'wal')
     assert.deepEqual(inspection.prepare(`SELECT name FROM sqlite_schema
       WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all().map(row => row.name),
-    ['conversations', 'devices', 'messages', 'runs'])
+    ['command_receipts', 'conversations', 'devices', 'goal_contexts', 'goals', 'messages', 'progress_entries', 'runs', 'tasks'])
     assert.deepEqual(inspection.prepare('PRAGMA foreign_key_check').all(), [])
     assert.deepEqual(inspection.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check), ['ok'])
   } finally {

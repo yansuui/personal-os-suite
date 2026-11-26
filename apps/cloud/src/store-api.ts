@@ -8,6 +8,15 @@ import type {
   ConversationRecord,
   DeviceRecord,
   DeviceRole,
+  GoalQuestionContext,
+  GoalListItem,
+  GoalStatus,
+  GoalView,
+  GoalRecord,
+  CommandResult,
+  TaskRecord,
+  TaskStatus,
+  TaskView,
   MessageRecord,
   MessageWithRun,
   RunLease,
@@ -25,6 +34,52 @@ export interface InsertMessageInput {
   text: string
   /** 客户端幂等键；同一会话内重复提交必须复用同一条消息与同一个运行。 */
   clientRequestId: string | null
+  /** 目标关联提问时由服务端绑定；普通聊天保持 null/缺省。 */
+  goalId?: string | null
+}
+export interface CreateGoalInput {
+  deviceId: string
+  commandId: string
+  title: string
+  description?: string | null
+  successCriteria?: string | null
+  targetDate?: string | null
+}
+
+export type GoalCommandInput = {
+  deviceId: string
+  commandId: string
+  expectedRevision: number
+} & (
+  | { action: 'update'; title?: string; description?: string | null; successCriteria?: string | null; targetDate?: string | null }
+  | { action: 'complete' | 'archive' | 'restore' | 'reopen' }
+)
+
+export interface CreateTaskInput {
+  deviceId: string
+  commandId: string
+  title: string
+  description?: string | null
+  dueDate?: string | null
+}
+
+export type TaskCommandInput = {
+  deviceId: string
+  commandId: string
+  expectedRevision: number
+} & (
+  | { action: 'update'; title?: string; description?: string | null; dueDate?: string | null }
+  | { action: 'progress'; note: string }
+  | { action: 'set_status'; status: TaskStatus; note?: string | null; resultNote?: string | null }
+)
+
+export class GoalCommandError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'GoalCommandError'
+    this.code = code
+  }
 }
 
 export interface CompleteRunInput {
@@ -59,15 +114,29 @@ export interface CloudStoreApi {
    * - 同时把会话 updatedAt 推到 now。
    */
   appendUserMessage(input: InsertMessageInput): MessageWithRun
+  /** 读取某次运行实际绑定的目标快照；普通聊天返回 null。 */
+  goalContextForRun(runId: string): GoalQuestionContext | null
 
   // --- 运行 ---
   getRun(id: string): RunRecord | null
-  /** 取最早一条 queued 运行并租给它；没有则 null。同一时刻只允许一条被租（lease 过期除外）。 */
-  leaseRun(input: { leaseMs: number }): RunLease | null
+  /** Take the earliest eligible queued run. Old workers cannot lease goal runs. */
+  leaseRun(input: { leaseMs: number; goalQuestionsVersion?: number }): RunLease | null
   /** 校验 leaseToken；成功后按 status 落终态并写 resultText/error。租约失效返回 null。 */
   completeRun(id: string, leaseToken: string, input: CompleteRunInput): RunRecord | null
   /** 取消 queued 或 running 的运行；已终态返回原记录（幂等）。 */
   cancelRun(id: string): RunRecord | null
+
+  // --- 目标与业务任务 ---
+  listGoals(status?: GoalStatus, after?: number, limit?: number): {
+    goals: GoalListItem[]
+    nextCursor: number | null
+  }
+  getGoalView(id: string): GoalView | null
+  createGoal(input: CreateGoalInput): CommandResult<GoalRecord>
+  updateGoal(id: string, input: GoalCommandInput): CommandResult<GoalRecord> | null
+  createTask(goalId: string, input: CreateTaskInput): CommandResult<TaskRecord> | null
+  getTask(id: string, page?: { after?: number; limit?: number; revision?: number }): TaskView | null
+  updateTask(id: string, input: TaskCommandInput): CommandResult<TaskRecord> | null
 
   // --- 维护 ---
   /** 测试与运维用：把过期租约的 running 运行放回 queued。返回放回条数。 */

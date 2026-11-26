@@ -95,6 +95,7 @@ public struct Run: Sendable, Codable, Equatable {
     public let messageId: String
     public let status: String
     public let error: String?
+    public let goalId: String?
 }
 
 public enum RunStatus: String, Sendable, Codable, CaseIterable {
@@ -132,9 +133,11 @@ public struct RunRecord: Sendable, Codable, Equatable, Identifiable {
     public var serverError: String?
     public var pollingError: String?
     public var cancellationError: String?
+    public var goalID: String?
 
     public init(runID: String, conversationID: String, messageID: String, status: RunStatus,
-                serverError: String? = nil, pollingError: String? = nil, cancellationError: String? = nil) {
+                serverError: String? = nil, pollingError: String? = nil, cancellationError: String? = nil,
+                goalID: String? = nil) {
         self.runID = runID
         self.conversationID = conversationID
         self.messageID = messageID
@@ -142,6 +145,7 @@ public struct RunRecord: Sendable, Codable, Equatable, Identifiable {
         self.serverError = serverError
         self.pollingError = pollingError
         self.cancellationError = cancellationError
+        self.goalID = goalID
     }
 }
 
@@ -158,13 +162,16 @@ public struct PendingMessage: Sendable, Codable, Equatable, Identifiable {
     public let clientRequestID: String
     public let text: String
     public let createdAt: String
+    /// nil 同时兼容升级前的普通待发消息；重试时绝不读取当前关联替代它。
+    public let goalID: String?
 
     public init(conversationID: String, clientRequestID: String = UUID().uuidString,
-                text: String, createdAt: String) {
+                text: String, createdAt: String, goalID: String? = nil) {
         self.conversationID = conversationID
         self.clientRequestID = clientRequestID
         self.text = text
         self.createdAt = createdAt
+        self.goalID = goalID
     }
 
     public var request: SendMessageRequest {
@@ -252,17 +259,25 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
     public let conversationStates: [ConversationSnapshot]
     public let pendingMessages: [PendingMessage]
     public let runRecords: [RunRecord]
+    public let goals: [Goal]
+    public let goalDetails: [GoalDetail]
+    /// 本机会话选择；实际发送意图在 PendingMessage.goalID 中冻结。
+    public let conversationGoalIDs: [String: String]
+    public let identityKey: String?
+    public let goalCache: GoalCache
 
     private enum CodingKeys: String, CodingKey {
         case savedAt, timeline, cursor, tasks, context
         case conversations, selectedConversationID, conversationStates, pendingMessages, runRecords
+        case goals, goalDetails, conversationGoalIDs, identityKey, goalCache
     }
 
     public init(savedAt: String, timeline: [ChatMessage] = [], cursor: Int = 0,
                 tasks: [TaskSummary] = [], context: ContextSnapshot? = nil,
                 conversations: [Conversation] = [], selectedConversationID: String? = nil,
                 conversationStates: [ConversationSnapshot] = [], pendingMessages: [PendingMessage] = [],
-                runRecords: [RunRecord] = []) {
+                runRecords: [RunRecord] = [], goals: [Goal] = [], goalDetails: [GoalDetail] = [],
+                conversationGoalIDs: [String: String] = [:], identityKey: String? = nil, goalCache: GoalCache = GoalCache()) {
         self.savedAt = savedAt
         self.timeline = timeline
         self.cursor = cursor
@@ -273,6 +288,11 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
         self.conversationStates = conversationStates
         self.pendingMessages = pendingMessages
         self.runRecords = runRecords
+        self.goals = goals
+        self.goalDetails = goalDetails
+        self.conversationGoalIDs = conversationGoalIDs
+        self.identityKey = identityKey
+        self.goalCache = goalCache
     }
 
     public init(from decoder: Decoder) throws {
@@ -287,5 +307,10 @@ public struct CachedSnapshot: Sendable, Codable, Equatable {
         conversationStates = try values.decodeIfPresent([ConversationSnapshot].self, forKey: .conversationStates) ?? []
         pendingMessages = try values.decodeIfPresent([PendingMessage].self, forKey: .pendingMessages) ?? []
         runRecords = try values.decodeIfPresent([RunRecord].self, forKey: .runRecords) ?? []
+        goals = try values.decodeIfPresent([Goal].self, forKey: .goals) ?? []
+        goalDetails = try values.decodeIfPresent([GoalDetail].self, forKey: .goalDetails) ?? []
+        conversationGoalIDs = try values.decodeIfPresent([String: String].self, forKey: .conversationGoalIDs) ?? [:]
+        identityKey = try values.decodeIfPresent(String.self, forKey: .identityKey)
+        goalCache = try values.decodeIfPresent(GoalCache.self, forKey: .goalCache) ?? GoalCache()
     }
 }

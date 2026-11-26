@@ -11,9 +11,13 @@ if (!/^(0|[1-9]\d*)$/.test(portValue) || !Number.isSafeInteger(port) || port > 6
 }
 const dbPath = process.env.DB_PATH ?? './data/cloud.sqlite'
 if (dbPath.trim().length === 0) throw new Error('DB_PATH must not be empty.')
+const goalQuestionsFlag = process.env.POS_GOAL_QUESTIONS_ENABLED ?? '0'
+if (goalQuestionsFlag !== '0' && goalQuestionsFlag !== '1') {
+  throw new Error('POS_GOAL_QUESTIONS_ENABLED must be 0 or 1.')
+}
 
 const store = new CloudStore(dbPath)
-const server = createV2Server({ store, adminSecret, model: process.env.POS_MODEL })
+const server = createV2Server({ store, adminSecret, model: process.env.POS_MODEL, goalQuestionsEnabled: goalQuestionsFlag === '1' })
 let stopping = false
 let storeClosed = false
 

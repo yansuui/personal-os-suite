@@ -4,8 +4,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
-const read = name => fs.readFileSync(path.join(root, name), 'utf8');
-const contract = fs.readFileSync(path.resolve(root, '../../packages/contracts/MINIMAL-V2-CONTRACT.md'), 'utf8');
+const read = name => fs.readFileSync(path.join(root, name), 'utf8').replace(/\r\n/g, '\n');
+const contract = fs.readFileSync(path.resolve(root, '../../packages/contracts/MINIMAL-V2-CONTRACT.md'), 'utf8')
+  + '\n' + fs.readFileSync(path.resolve(root, '../../packages/contracts/PHASE-2-GOALS-TASKS.md'), 'utf8');
 const api = read('Sources/POSCore/URLSessionPOSAPI.swift');
 const protocol = read('Sources/POSCore/POSAPI.swift');
 const models = read('Sources/POSCore/Models.swift');
@@ -40,16 +41,32 @@ const method = (source, name, next) => {
 };
 
 check('HTTP routes match the frozen v2 client contract', () => {
-  const routes = [...new Set([...api.matchAll(/"(v\d+\/[^"\n]+)"/g)].map(match => '/' + match[1].replace('\\(conversationID)', ':conversationId').replace('\\(runID)', ':runId')))];
-  // cancelRun composes the frozen path from the shared, validated runsPath helper.
-  if (api.includes('path: runsPath(runID) + "/cancel"')) routes.push('/v2/runs/:runId/cancel');
-  assert.deepEqual(routes.sort(), ['/v2/health', '/v2/pair', '/v2/me', '/v2/conversations', '/v2/conversations/:conversationId/messages', '/v2/runs/:runId', '/v2/runs/:runId/cancel'].sort());
-  for (const route of routes) assert.ok(contract.includes(route), `route missing from contract: ${route}`);
+  const routes = [...new Set([...api.matchAll(/"(v\d+\/[^"\n]+)"/g)].map(match => '/' + match[1]
+    .replace('\\(conversationID)', ':conversationId').replace('\\(runID)', ':runId')
+    .replace('\\(goalID)', ':goalId').replace('\\(taskID)', ':taskId')))];
+  // Dynamic helpers compose only these documented subresources.
+  for (const [helper, suffix, route] of [
+    ['runsPath(runID)', '/cancel', '/v2/runs/:runId/cancel'],
+    ['runsPath(runID)', '/goal-context', '/v2/runs/:runId/goal-context'],
+    ['goalPath(goalID)', '/commands', '/v2/goals/:goalId/commands'],
+    ['goalPath(goalID)', '/tasks', '/v2/goals/:goalId/tasks'],
+    ['goalPath(goalID)', '/questions', '/v2/goals/:goalId/questions'],
+  ]) if (api.includes(`path: ${helper} + "${suffix}"`)) routes.push(route);
+  for (const route of ['/v2/health', '/v2/pair', '/v2/me', '/v2/conversations', '/v2/conversations/:conversationId/messages', '/v2/runs/:runId', '/v2/runs/:runId/cancel']) {
+    assert.ok(routes.includes(route), `missing original chat route: ${route}`);
+  }
+  for (const route of routes) {
+    assert.ok(contract.includes(route) || contract.includes(route.replace(/:(goalId|taskId|runId)/g, ':id')),
+      `route missing from contract: ${route}`);
+  }
   for (const file of sources) assert.ok(!/\bv1\//.test(fs.readFileSync(file, 'utf8')), `${file} still references v1`);
 });
 check('POSAPI only exposes supported client operations', () => {
-  assert.deepEqual([...protocol.matchAll(/func (\w+)\(/g)].map(m => m[1]).sort(),
-    ['health', 'pair', 'me', 'createConversation', 'conversations', 'messages', 'sendMessage', 'run', 'cancelRun'].sort());
+  const methods = [...protocol.split('public extension POSAPI')[0].matchAll(/func (\w+)\(/g)].map(m => m[1]);
+  assert.deepEqual(methods.sort(),
+    ['health', 'pair', 'me', 'createConversation', 'conversations', 'messages', 'sendMessage', 'run', 'cancelRun',
+      'capabilities', 'goals', 'goal', 'createGoal', 'updateGoal', 'createGoalTask', 'updateGoalTask',
+      'goalTask', 'askGoal', 'goalContext'].sort());
   assert.ok(!/api\.(tasks|approve|submitVerdict|context|presence|timeline)\(/.test(app + sync));
 });
 check('pair wire shape and credentials are isolated', () => {

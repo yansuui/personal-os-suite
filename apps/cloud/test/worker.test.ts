@@ -252,6 +252,41 @@ test('rejects a model response without text content and completes with a safe fa
   assert.equal(JSON.stringify(completion).includes('hello'), false)
 })
 
+test('a marked goal run fails closed when its fixed context is unavailable', async () => {
+  let modelCalls = 0
+  let completion: Record<string, unknown> | undefined
+  const fetchImpl = mockFetch(async (url, init) => {
+    if (url.pathname === '/v2/health') return response({ ok: true, service: 'personal-os-cloud', protocolVersion: 2 })
+    if (url.pathname === '/v2/me') return response({ device: { id: 'agent_1', role: 'agent' } })
+    if (url.pathname === '/v2/runs/lease') return response({ run: {
+      id: 'run_1', conversationId: 'conv_1', messageId: 'message_1', status: 'running',
+      goalId: 'goal_1', leaseToken: 'lease_token', leasedUntil: new Date(Date.now() + baseConfig.leaseMs).toISOString(),
+    }, leaseToken: 'lease_token' })
+    if (url.pathname === '/v2/conversations/conv_1/messages') return response({ messages: [{
+      id: 'message_1', conversationId: 'conv_1', role: 'user', text: 'goal question', seq: 1,
+    }], nextCursor: 1 })
+    if (url.pathname === '/v2/runs/run_1/goal-context') return response({ error: { code: 'not_found' } }, 404)
+    if (url.pathname === '/v2/runs/run_1') return response({ run: {
+      id: 'run_1', conversationId: 'conv_1', messageId: 'message_1', status: 'running',
+      goalId: 'goal_1', leaseToken: 'lease_token', leasedUntil: new Date(Date.now() + baseConfig.leaseMs).toISOString(),
+    } })
+    if (url.pathname === '/v2/runs/run_1/complete') {
+      completion = JSON.parse(String(init.body)) as Record<string, unknown>
+      return response({ run: { status: 'failed' } })
+    }
+    if (url.pathname === '/v1/chat/completions') {
+      modelCalls += 1
+      return response({ choices: [{ message: { content: 'must not answer without facts' } }] })
+    }
+    throw new Error(`Unexpected test path: ${url.pathname}`)
+  })
+  const worker = new ChatWorker(baseConfig, { fetchImpl })
+  const result = await worker.processNextRun()
+  assert.equal(result.status, 'failed')
+  assert.equal(modelCalls, 0)
+  assert.equal(completion?.status, 'failed')
+})
+
 test('does not send the agent credential to the model endpoint', async () => {
   let modelAuthorization: string | null | undefined
   const fetchImpl = mockFetch(async (url, init) => {
