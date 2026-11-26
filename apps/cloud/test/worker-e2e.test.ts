@@ -56,7 +56,7 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
 type ModelRequest = { model: string; messages: Array<{ role: string; content: string }>; input?: Array<{ role: string; content: string }>; stream?: boolean; store?: boolean; prompt_cache_key?: string; max_output_tokens?: number }
 type ModelHandler = (body: ModelRequest, response: ServerResponse, request: IncomingMessage) => void
 
-async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => Date, modelApi: WorkerConfig['modelApi'] = 'chat-completions') {
+async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => Date, modelApi: WorkerConfig['modelApi'] = 'chat-completions', goalQuestionsEnabled = false) {
   const directory = mkdtempSync(join(tmpdir(), 'personal-os-worker-e2e-'))
   const store = new CloudStore(join(directory, 'cloud.sqlite'), now)
   const servers: Server[] = []
@@ -81,7 +81,7 @@ async function fixture(t: TestContext, modelHandler: ModelHandler, now?: () => D
     }
   })
   const pairSecret = randomUUID()
-  const server = createV2Server({ store, adminSecret: pairSecret, now })
+  const server = createV2Server({ store, adminSecret: pairSecret, now, goalQuestionsEnabled })
   servers.push(server)
   const apiBaseUrl = await bind(server)
   async function call(path: string, token?: string, body?: unknown) {
@@ -353,6 +353,173 @@ test('Responses rejects unfinished or missing message status even when the respo
     assert.equal((await f.execute(f.worker())).status, 'failed')
     assert.equal((await f.messages()).data.messages.length, 1)
   }
+})
+
+for (const modelApi of ['chat-completions', 'responses'] as const) {
+  test(`${modelApi} goal questions use their fixed HTTP snapshot and refresh facts only for a new question`, async (t) => {
+    const f = await fixture(t, (_body, response) => {
+      if (modelApi === 'responses') responsesAnswer(response, 'reply based on the fixed goal snapshot')
+      else answer(response, 'reply based on the fixed goal snapshot')
+    }, undefined, modelApi, true)
+    const goalResponse = await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Launch the personal assistant' })
+    assert.equal(goalResponse.status, 201)
+    const goalId = goalResponse.data.goal.id as string
+    const tasksPath = `/v2/goals/${goalId}/tasks`
+    const taskResponse = await f.call(tasksPath, f.clientToken, { commandId: randomUUID(), title: 'Verify goal answers' })
+    assert.equal(taskResponse.status, 201)
+    const task = taskResponse.data.task
+    const questionsPath = `/v2/goals/${goalId}/questions`
+    const question = { conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'What remains?' }
+    const first = await f.call(questionsPath, f.clientToken, question)
+    assert.equal(first.status, 201)
+    const contextPath = `/v2/runs/${first.data.run.id}/goal-context`
+    const original = (await f.call(contextPath, f.clientToken)).data.goalContext
+    assert.equal(original.summary.todoTasks, 1)
+    assert.equal(original.summary.blockedTasks, 0)
+    const changed = await f.call(`/v2/tasks/${task.id}/commands`, f.clientToken, {
+      commandId: randomUUID(), expectedRevision: task.revision,
+      action: 'set_status', status: 'blocked', note: 'Waiting for device verification',
+    })
+    assert.equal(changed.status, 200)
+    const unrelated = await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Unrelated private goal' })
+    assert.equal(unrelated.status, 201)
+    assert.equal((await f.execute(f.worker())).status, 'completed')
+    const turns = modelApi === 'responses' ? f.requests[0].input! : f.requests[0].messages
+    const facts = turns.filter((turn) => turn.role === 'system')
+    assert.equal(facts.length, 1)
+    assert.deepEqual(JSON.parse(facts[0].content.slice(facts[0].content.indexOf('{'))), original)
+    assert.equal(JSON.stringify(turns).includes('Waiting for device verification'), false)
+    assert.equal(JSON.stringify(turns).includes('Unrelated private goal'), false)
+    assert.deepEqual((await f.call(contextPath, f.clientToken)).data.goalContext, original)
+    const replay = await f.call(questionsPath, f.clientToken, question)
+    assert.equal(replay.status, 200)
+    assert.equal(replay.data.run.id, first.data.run.id)
+    assert.equal((await f.execute(f.worker())).status, 'idle')
+    assert.equal(f.requests.length, 1)
+    const otherClient = await f.call('/v2/pair', undefined, { name: 'second-phone', role: 'client' })
+    const otherMessages = await f.call(`${f.messagesPath}?after=0&wait=0`, otherClient.data.token)
+    assert.deepEqual(otherMessages.data.messages, (await f.messages()).data.messages)
+    assert.equal(otherMessages.data.messages.filter((message: { role: string }) => message.role === 'assistant').length, 1)
+
+    const second = await f.call(questionsPath, f.clientToken, { ...question, clientRequestId: randomUUID() })
+    assert.equal(second.status, 201)
+    const fresh = (await f.call(`/v2/runs/${second.data.run.id}/goal-context`, f.clientToken)).data.goalContext
+    assert.ok(fresh.viewRevision > original.viewRevision)
+    assert.equal(fresh.summary.todoTasks, 0)
+    assert.equal(fresh.summary.blockedTasks, 1)
+    assert.equal((await f.execute(f.worker())).status, 'completed')
+    const newTurns = modelApi === 'responses' ? f.requests[1].input! : f.requests[1].messages
+    const newFacts = newTurns.filter((turn) => turn.role === 'system')
+    assert.equal(newFacts.length, 1)
+    assert.deepEqual(JSON.parse(newFacts[0].content.slice(newFacts[0].content.indexOf('{'))), fresh)
+    assert.equal((await f.call(`/v2/goals/${goalId}`, f.clientToken)).data.goalView.viewRevision, fresh.viewRevision)
+    assert.equal((await f.call(`/v2/tasks/${task.id}`, f.clientToken)).data.task.status, 'blocked')
+    assert.equal((await f.messages()).data.messages.filter((message: { role: string }) => message.role === 'assistant').length, 2)
+  })
+
+  test(`${modelApi} rejects a goal snapshot that cannot fit with its question before model HTTP`, async (t) => {
+    const f = await fixture(t, (_body, response) => {
+      if (modelApi === 'responses') responsesAnswer(response, 'must not execute')
+      else answer(response, 'must not execute')
+    }, undefined, modelApi, true)
+    const goal = (await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Goal exceeds configured budget' })).data.goal
+    const sent = await f.call(`/v2/goals/${goal.id}/questions`, f.clientToken, {
+      conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'Review',
+    })
+    assert.equal(sent.status, 201)
+    assert.equal((await f.execute(f.worker({ maxContextChars: 50 }))).status, 'failed')
+    assert.equal(f.requests.length, 0)
+    assert.equal((await f.run(sent.data.run.id)).data.run.status, 'failed')
+    assert.equal((await f.messages()).data.messages.length, 1)
+  })
+
+  test(`${modelApi} reserves the goal snapshot character budget by dropping only old chat history`, async (t) => {
+    const f = await fixture(t, (_body, response) => {
+      if (modelApi === 'responses') responsesAnswer(response, 'bounded goal answer')
+      else answer(response, 'bounded goal answer')
+    }, undefined, modelApi, true)
+    const history = f.store.appendUserMessage({ conversationId: f.conversationId, role: 'user', text: 'old question '.repeat(10), clientRequestId: randomUUID() })
+    const lease = f.store.leaseRun({ leaseMs: f.config.leaseMs })!
+    assert.equal(lease.run.id, history.run.id)
+    f.store.completeRun(history.run.id, lease.leaseToken, { status: 'completed', resultText: 'old answer '.repeat(10) })
+    const goal = (await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Preserve full facts' })).data.goal
+    const sent = await f.call(`/v2/goals/${goal.id}/questions`, f.clientToken, {
+      conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'Current goal question',
+    })
+    assert.equal(sent.status, 201)
+    const context = (await f.call(`/v2/runs/${sent.data.run.id}/goal-context`, f.clientToken)).data.goalContext
+    const maxContextChars = JSON.stringify(context).length + 200
+    assert.equal((await f.execute(f.worker({ maxContextChars }))).status, 'completed')
+    const turns = modelApi === 'responses' ? f.requests[0].input! : f.requests[0].messages
+    assert.ok(turns.reduce((total, turn) => total + turn.content.length, 0) <= maxContextChars)
+    assert.deepEqual(turns.map((turn) => turn.role), ['system', 'user'])
+    assert.equal(turns.at(-1)!.content, 'Current goal question')
+    assert.deepEqual(JSON.parse(turns[0].content.slice(turns[0].content.indexOf('{'))), context)
+  })
+
+  test(`${modelApi} counts goal facts toward the message budget without dropping the current question`, async (t) => {
+    const f = await fixture(t, (_body, response) => {
+      if (modelApi === 'responses') responsesAnswer(response, 'bounded goal answer')
+      else answer(response, 'bounded goal answer')
+    }, undefined, modelApi, true)
+    const goal = (await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Message budget' })).data.goal
+    const path = `/v2/goals/${goal.id}/questions`
+    const first = await f.call(path, f.clientToken, {
+      conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'First question',
+    })
+    assert.equal(first.status, 201)
+    assert.equal((await f.execute(f.worker({ maxContextMessages: 1 }))).status, 'failed')
+    assert.equal(f.requests.length, 0)
+    const second = await f.call(path, f.clientToken, {
+      conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'Second question',
+    })
+    assert.equal(second.status, 201)
+    assert.equal((await f.execute(f.worker({ maxContextMessages: 2 }))).status, 'completed')
+    const turns = modelApi === 'responses' ? f.requests[0].input! : f.requests[0].messages
+    assert.deepEqual(turns.map((turn) => turn.role), ['system', 'user'])
+    assert.equal(turns.at(-1)!.content, 'Second question')
+  })
+}
+
+test('a recovered goal run keeps its original snapshot after business changes and remains fenced from old workers', async (t) => {
+  let timestamp = Date.now()
+  const started = deferred<void>()
+  let attempts = 0
+  const f = await fixture(t, (_body, response) => {
+    attempts += 1
+    if (attempts === 1) started.resolve()
+    else responsesAnswer(response, 'recovered goal reply')
+  }, () => new Date(timestamp), 'responses', true)
+  const created = await f.call('/v2/goals', f.clientToken, { commandId: randomUUID(), title: 'Original goal title' })
+  assert.equal(created.status, 201)
+  const goal = created.data.goal
+  const sent = await f.call(`/v2/goals/${goal.id}/questions`, f.clientToken, {
+    conversationId: f.conversationId, clientRequestId: randomUUID(), text: 'Review this goal',
+  })
+  assert.equal(sent.status, 201)
+  const firstWorker = f.worker()
+  const work = f.execute(firstWorker)
+  await bounded(started.promise)
+  const originalRun = f.store.getRun(sent.data.run.id)!
+  firstWorker.shutdown()
+  assert.equal((await bounded(work)).status, 'stopped')
+  const updated = await f.call(`/v2/goals/${goal.id}/commands`, f.clientToken, {
+    commandId: randomUUID(), expectedRevision: goal.revision, action: 'update', title: 'Changed after worker stopped',
+  })
+  assert.equal(updated.status, 200)
+  timestamp += f.config.leaseMs + 1
+  const oldLease = await f.call('/v2/runs/lease', f.config.agentToken, { leaseMs: f.config.leaseMs })
+  assert.equal(oldLease.status, 200)
+  assert.equal(oldLease.data.run, null)
+  assert.equal((await f.execute(f.worker())).status, 'completed')
+  assert.equal(f.requests.length, 2)
+  const firstFacts = f.requests[0].input!.find((turn) => turn.role === 'system')!
+  const recoveredFacts = f.requests[1].input!.find((turn) => turn.role === 'system')!
+  assert.deepEqual(recoveredFacts, firstFacts)
+  assert.equal(firstFacts.content.includes('Original goal title'), true)
+  assert.equal(recoveredFacts.content.includes('Changed after worker stopped'), false)
+  assert.equal(f.store.completeRun(originalRun.id, originalRun.leaseToken!, { status: 'completed', resultText: 'late answer' }), null)
+  assert.deepEqual((await f.messages()).data.messages.map((message: { text: string }) => message.text), ['Review this goal', 'recovered goal reply'])
 })
 
 test('Responses cancellation aborts upstream HTTP without a late reply', async (t) => {

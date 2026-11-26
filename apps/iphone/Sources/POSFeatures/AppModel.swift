@@ -545,6 +545,24 @@ public final class AppModel: ObservableObject {
 
     // MARK: - v2 目标、持久命令草稿与固定问答依据
 
+    /// 界面刷新持有整条读取链的身份，避免旧页面在重新配对后继续读取旧对象。
+    public func refreshGoalData(goalID: String? = nil, taskID: String? = nil) async {
+        let identity = identityGeneration
+        guard !Task.isCancelled else { return }
+        await reconnect()
+        guard identity == identityGeneration, !Task.isCancelled else { return }
+        await refreshGoals()
+        guard identity == identityGeneration, !Task.isCancelled else { return }
+        if let goalID {
+            await loadGoal(goalID, force: true)
+            guard identity == identityGeneration, !Task.isCancelled else { return }
+        }
+        if let taskID {
+            await loadGoalTask(taskID, force: true)
+            guard identity == identityGeneration, !Task.isCancelled else { return }
+        }
+    }
+
     public func refreshGoals() async {
         guard phase.isReady, hasValidatedServer, !isLoadingGoals, let api, let session else { return }
         let identity = identityGeneration

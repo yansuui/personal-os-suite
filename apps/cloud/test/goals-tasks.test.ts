@@ -347,6 +347,10 @@ test('goal/task HTTP routes expose stable envelopes, enforce client writes and r
   assert.equal(created.status, 201)
   assert.equal(created.json.created, true)
   assert.deepEqual(Object.keys(created.json), ['goal', 'created'])
+  const unfilteredGoals = await call('/v2/goals', client, undefined, 'GET')
+  assert.equal(unfilteredGoals.status, 200)
+  assert.equal(unfilteredGoals.json.goals.length, 1)
+  assert.equal(unfilteredGoals.json.goals[0].id, created.json.goal.id)
   const replay = await call('/v2/goals', client, {
     commandId: 'http-goal-create', title: 'Goal', targetDate: '2026-03-04',
   })

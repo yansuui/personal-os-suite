@@ -164,6 +164,28 @@ check('new sends and pending confirmation have focused AppModel regressions', ()
   assert.ok(featureTarget.includes('- target: POSCore') && featureTarget.includes('- target: POSFeatures'));
   assert.ok(project.includes('POSFeaturesTests: [test]') && project.includes('- name: POSFeaturesTests'));
 });
+check('goal screen refreshes preserve identity across every awaited request', () => {
+  const refresh = method(app, 'refreshGoalData', 'refreshGoals');
+  const awaits = [...refresh.matchAll(/await (reconnect|refreshGoals|loadGoal|loadGoalTask)\([^\n]*\)/g)];
+  assert.equal(awaits.length, 4);
+  for (let index = 0; index < awaits.length; index++) {
+    const start = awaits[index].index + awaits[index][0].length;
+    const end = awaits[index + 1]?.index ?? refresh.length;
+    assert.ok(refresh.slice(start, end).includes('identity == identityGeneration'), 'missing identity guard after ' + awaits[index][1]);
+    assert.ok(refresh.slice(start, end).includes('!Task.isCancelled'), 'missing cancellation guard after ' + awaits[index][1]);
+  }
+  const view = read('Sources/POSFeatures/Views/GoalsView.swift');
+  assert.equal([...view.matchAll(/await model.refreshGoalData\(\)/g)].length, 3); // list pull/toolbar and draft reconnect
+  assert.equal([...view.matchAll(/await model.refreshGoalData\(goalID: goalID\)/g)].length, 2);
+  assert.ok(view.includes('await model.refreshGoalData(goalID: task.goalId, taskID: task.id)'));
+  assert.ok(!view.includes('await model.reconnect()'), 'view refresh must use the guarded AppModel sequence');
+  const regressions = read('Tests/POSFeaturesTests/AppModelGoalTests.swift');
+  for (const name of ['testGoalScreenRefreshStopsAfterReconnectWhenIdentityChanges',
+    'testGoalScreenRefreshStopsAfterGoalListWhenIdentityChanges',
+    'testTaskScreenRefreshStopsAfterGoalReadWhenIdentityChanges']) {
+    assert.ok(regressions.includes(`func ${name}(`), `missing ${name}`);
+  }
+});
 check('focused XCTest sources cover contract and persistence regressions', () => {
   const testText = tests.map(file => fs.readFileSync(file, 'utf8')).join('\n');
   for (const name of ['testPairUsesOnlyNameRoleAndPairSecret', 'testCreateAndListConversationsUseFrozenEnvelopes',

@@ -222,6 +222,63 @@ final class AppModelGoalTests: XCTestCase {
     }
 
     @MainActor
+    func testGoalScreenRefreshStopsAfterReconnectWhenIdentityChanges() async throws {
+        let (model, oldAPI, newAPI, _) = try await makeIdentitySwapModel()
+        defer { model.signOut() }
+        await oldAPI.holdNextHealth()
+        let refresh = Task { @MainActor in await model.refreshGoalData(goalID: "goal-1") }
+        await oldAPI.waitForHealth()
+
+        await pairNewIdentity(model)
+        await oldAPI.releaseHealth()
+        await refresh.value
+
+        let goalReads = await newAPI.recordedGoalReads()
+        XCTAssertTrue(goalReads.isEmpty)
+        XCTAssertTrue(model.goalsOnline)
+        XCTAssertNil(model.goalsError)
+        XCTAssertEqual(model.goals.map(\.id), ["new-goal"])
+    }
+
+    @MainActor
+    func testGoalScreenRefreshStopsAfterGoalListWhenIdentityChanges() async throws {
+        let (model, oldAPI, newAPI, _) = try await makeIdentitySwapModel()
+        defer { model.signOut() }
+        await oldAPI.holdNextGoalList()
+        let refresh = Task { @MainActor in await model.refreshGoalData(goalID: "goal-1") }
+        await oldAPI.waitForGoalList()
+
+        await pairNewIdentity(model)
+        await oldAPI.releaseGoalList()
+        await refresh.value
+
+        let goalReads = await newAPI.recordedGoalReads()
+        XCTAssertTrue(goalReads.isEmpty)
+        XCTAssertTrue(model.goalsOnline)
+        XCTAssertNil(model.goalsError)
+        XCTAssertEqual(model.goals.map(\.id), ["new-goal"])
+    }
+
+    @MainActor
+    func testTaskScreenRefreshStopsAfterGoalReadWhenIdentityChanges() async throws {
+        let (model, oldAPI, newAPI, _) = try await makeIdentitySwapModel()
+        defer { model.signOut() }
+        await oldAPI.holdNextGoal()
+        let refresh = Task { @MainActor in await model.refreshGoalData(goalID: "goal-1", taskID: "task-1") }
+        await oldAPI.waitForGoal()
+
+        await pairNewIdentity(model)
+        await oldAPI.releaseGoal()
+        await refresh.value
+
+        let taskReads = await newAPI.recordedGoalTaskReads()
+        XCTAssertTrue(taskReads.isEmpty)
+        XCTAssertTrue(model.goalsOnline)
+        XCTAssertNil(model.goalsError)
+        XCTAssertEqual(model.goals.map(\.id), ["new-goal"])
+    }
+
+    @MainActor
     func testPendingQuestionRetryKeepsOriginalGoalAfterSelectionChanges() async throws {
         let api = try GoalScenarioAPI()
         await api.failQuestions(2)
@@ -436,6 +493,13 @@ private actor GoalScenarioAPI: POSAPI {
     private var questionsEnabled = true
     private var questionFailures = 0
     private var healthOffline = false
+    private var holdHealth = false
+    private var healthGate: CheckedContinuation<Void, Never>?
+    private var healthWaiters: [CheckedContinuation<Void, Never>] = []
+    private var holdGoalList = false
+    private var goalListGate: CheckedContinuation<Void, Never>?
+    private var goalListWaiters: [CheckedContinuation<Void, Never>] = []
+    private var goalReads: [String] = []
     private var holdCreate = false
     private var createGate: CheckedContinuation<Void, Never>?
     private var createWaiters: [CheckedContinuation<Void, Never>] = []
@@ -470,6 +534,19 @@ private actor GoalScenarioAPI: POSAPI {
     func setQuestionsEnabled(_ value: Bool) { questionsEnabled = value }
     func failQuestions(_ count: Int) { questionFailures = count }
     func setHealthOffline(_ value: Bool) { healthOffline = value }
+    func recordedGoalReads() -> [String] { goalReads }
+    func holdNextHealth() { holdHealth = true }
+    func waitForHealth() async {
+        if healthGate != nil { return }
+        await withCheckedContinuation { healthWaiters.append($0) }
+    }
+    func releaseHealth() { healthGate?.resume(); healthGate = nil }
+    func holdNextGoalList() { holdGoalList = true }
+    func waitForGoalList() async {
+        if goalListGate != nil { return }
+        await withCheckedContinuation { goalListWaiters.append($0) }
+    }
+    func releaseGoalList() { goalListGate?.resume(); goalListGate = nil }
     func changeLiveGoalTitle(_ title: String) throws {
         goalRecords["goal-1"] = try GoalScenarioValues.goal(title: title, revision: 2)
     }
@@ -487,6 +564,13 @@ private actor GoalScenarioAPI: POSAPI {
     func releaseGoal() { goalGate?.resume(); goalGate = nil }
 
     func health() async throws -> HealthResponse {
+        if holdHealth {
+            holdHealth = false
+            await withCheckedContinuation { continuation in
+                healthGate = continuation
+                for waiter in healthWaiters { waiter.resume() }; healthWaiters = []
+            }
+        }
         if healthOffline { throw POSAPIError.transport("offline") }
         return try GoalScenarioValues.decode(["ok": true, "service": "personal-os-cloud", "protocolVersion": 2])
     }
@@ -510,9 +594,18 @@ private actor GoalScenarioAPI: POSAPI {
         POSCapabilities(goalsTasksVersion: 1, goalQuestionsVersion: questionsEnabled ? 1 : 0)
     }
     func goals(_ session: AuthSession, status: GoalStatus) async throws -> [Goal] {
-        goalRecords.values.filter { $0.status == status }.sorted { $0.id < $1.id }
+        let captured = goalRecords.values.filter { $0.status == status }.sorted { $0.id < $1.id }
+        if holdGoalList && status == .active {
+            holdGoalList = false
+            await withCheckedContinuation { continuation in
+                goalListGate = continuation
+                for waiter in goalListWaiters { waiter.resume() }; goalListWaiters = []
+            }
+        }
+        return captured
     }
     func goal(_ session: AuthSession, goalID: String) async throws -> GoalDetail {
+        goalReads.append(goalID)
         guard let goal = goalRecords[goalID] else { throw POSAPIError.server(status: 404, code: "not_found", message: "missing") }
         let captured: GoalDetail = try GoalScenarioValues.decode(["goal": GoalScenarioValues.object(goal),
             "tasks": goalID == taskRecord.goalId ? [GoalScenarioValues.object(taskRecord)] : [],

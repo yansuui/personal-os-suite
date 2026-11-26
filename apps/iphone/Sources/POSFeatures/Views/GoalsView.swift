@@ -66,9 +66,9 @@ struct GoalsView: View {
         .background(POSTheme.pageBackground)
         .navigationTitle("目标")
         .task { model.setGoalsTabActive(model.selectedTab == 1); await model.refreshGoals() }
-        .refreshable { await model.reconnect(); await model.refreshGoals() }
+        .refreshable { await model.refreshGoalData() }
         .toolbar {
-            RefreshToolbar(isRefreshing: model.isLoadingGoals) { Task { await model.reconnect(); await model.refreshGoals() } }
+            RefreshToolbar(isRefreshing: model.isLoadingGoals) { Task { await model.refreshGoalData() } }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { open(GoalDraft(id: "new-goal", kind: .createGoal)) } label: { Label("新目标", systemImage: "plus") }
                     .disabled(!model.phase.isReady || model.goalsCapabilities?.supportsGoals == false)
@@ -147,10 +147,10 @@ struct GoalDetailView: View {
         .task(id: goalID) { await model.loadGoal(goalID) }
         .onAppear { model.setVisibleGoal(goalID) }
         .onDisappear { model.setVisibleGoal(nil) }
-        .refreshable { await model.reconnect(); await model.refreshGoals(); await model.loadGoal(goalID, force: true) }
+        .refreshable { await model.refreshGoalData(goalID: goalID) }
         .toolbar {
             RefreshToolbar(isRefreshing: model.loadingGoalIDs.contains(goalID)) {
-                Task { await model.reconnect(); await model.refreshGoals(); await model.loadGoal(goalID, force: true) }
+                Task { await model.refreshGoalData(goalID: goalID) }
             }
         }
         .sheet(item: $editor) { route in GoalDraftEditorView(model: model, route: route) }
@@ -299,7 +299,7 @@ struct GoalTaskDetailView: View {
         .task(id: initialTask.id) { await model.loadGoalTask(initialTask.id) }
         .onAppear { model.setVisibleGoalTask(initialTask.id) }
         .onDisappear { model.setVisibleGoalTask(nil) }
-        .refreshable { await model.reconnect(); await model.loadGoal(task.goalId, force: true); await model.loadGoalTask(task.id, force: true) }
+        .refreshable { await model.refreshGoalData(goalID: task.goalId, taskID: task.id) }
         .sheet(item: $editor) { route in GoalDraftEditorView(model: model, route: route) }
     }
     private func open(_ draft: GoalDraft) {
@@ -405,7 +405,7 @@ struct GoalDraftEditorView: View {
                     if !model.canEditGoals {
                         Section {
                             Text("当前只保留本机草稿；连接并刷新服务器后，才能确认保存到云端。").font(.footnote)
-                            Button("重新连接并刷新") { Task { await model.reconnect(); await model.refreshGoals() } }
+                            Button("重新连接并刷新") { Task { await model.refreshGoalData() } }
                                 .disabled(model.isRefreshing || model.isLoadingGoals)
                         }
                     }

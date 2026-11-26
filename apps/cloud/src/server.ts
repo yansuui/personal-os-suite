@@ -314,7 +314,7 @@ export function createV2Server({ store, adminSecret, model, goalQuestionsEnabled
         const after = pageInteger(url, 'after', 0)
         const limit = pageInteger(url, 'limit', 50, 100)
         if (limit < 1) badRequest('limit must be between 1 and 100.')
-        sendJson(response, 200, store.listGoals(rawStatus as GoalStatus | undefined, after, limit))
+        sendJson(response, 200, store.listGoals(rawStatus === null ? undefined : rawStatus as GoalStatus, after, limit))
       } else {
         if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
         queryFields(url)
