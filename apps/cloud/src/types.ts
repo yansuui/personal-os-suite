@@ -51,11 +51,115 @@ export interface RunRecord {
   finishedAt: string | null
   resultText: string | null
   error: string | null
+  /** Optional for decoding runs created by an older server/cache. */
+  goalId?: string | null
 }
 
 export interface RunLease {
   run: RunRecord
   leaseToken: string
+}
+
+export type GoalStatus = 'active' | 'completed' | 'archived'
+export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'completed' | 'canceled'
+export type ProgressKind = 'status' | 'note' | 'result'
+
+export interface GoalRecord {
+  id: string
+  ownerId: string
+  title: string
+  description: string | null
+  successCriteria: string | null
+  targetDate: string | null
+  status: GoalStatus
+  archivedFromStatus: Exclude<GoalStatus, 'archived'> | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface TaskRecord {
+  id: string
+  ownerId: string
+  goalId: string
+  title: string
+  description: string | null
+  dueDate: string | null
+  status: TaskStatus
+  blockedReason: string | null
+  resultNote: string | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ProgressEntry {
+  id: string
+  taskId: string
+  actorDeviceId: string
+  kind: ProgressKind
+  note: string | null
+  fromStatus: TaskStatus | null
+  toStatus: TaskStatus | null
+  createdAt: string
+}
+
+export interface GoalSummary {
+  completedTasks: number
+  todoTasks: number
+  inProgressTasks: number
+  activeTasks: number
+  blockedTasks: number
+  canceledTasks: number
+  /** Null when there are no non-canceled tasks. */
+  completionPercent: number | null
+  latestUpdatedAt: string
+}
+
+export interface GoalListItem extends GoalRecord {
+  summary: GoalSummary
+  viewRevision: number
+}
+
+export interface GoalView {
+  goal: GoalRecord
+  tasks: TaskRecord[]
+  summary: GoalSummary
+  viewRevision: number
+  asOf: string
+}
+
+export interface TaskView {
+  task: TaskRecord
+  progressEntries: ProgressEntry[]
+  nextCursor: number | null
+  progressRevision: number
+}
+
+export interface GoalQuestionTask {
+  task: TaskRecord
+  progressEntries: ProgressEntry[]
+}
+
+export interface GoalQuestionContext {
+  runId: string
+  goalId: string
+  goal: GoalRecord
+  viewRevision: number
+  asOf: string
+  summary: GoalSummary
+  includedTasks: GoalQuestionTask[]
+  omissions: {
+    taskCount: number
+    progressEntryCount: number
+    truncatedFields: string[]
+    reasons: string[]
+  }
+}
+
+export interface CommandResult<T> {
+  value: T
+  created: boolean
 }
 
 /** POST /v2/conversations/:id/messages 的返回：写入的消息 + 为它创建（或复用）的运行。 */

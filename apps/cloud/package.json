@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node src/main.ts",
     "worker": "node src/worker/main.ts",
-    "test": "node --test test/api.test.ts test/store.test.ts test/integration.test.ts test/contract-e2e.test.ts test/worker.test.ts test/worker-e2e.test.ts",
+    "test": "node --test test/api.test.ts test/store.test.ts test/goals-tasks.test.ts test/integration.test.ts test/contract-e2e.test.ts test/worker.test.ts test/worker-e2e.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

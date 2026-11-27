@@ -8,7 +8,8 @@ import {
   publicDevice,
 } from './auth.ts'
 import type { CloudStoreApi, StoreClock } from './store-api.ts'
-import type { MessageRecord } from './types.ts'
+import type { GoalStatus, MessageRecord, TaskStatus } from './types.ts'
+import { GoalCommandError } from './store-api.ts'
 
 const MAX_BODY_BYTES = 1024 * 1024
 const POLL_INTERVAL_MS = 250
@@ -18,6 +19,8 @@ export interface V2ServerOptions {
   adminSecret: string
   /** Public configured worker model; never pass endpoint URLs or credentials. */
   model?: string
+  /** Explicit rollout gate for goal question creation. Defaults off. */
+  goalQuestionsEnabled?: boolean
   now?: StoreClock
 }
 
@@ -38,7 +41,7 @@ function badRequest(message: string): never {
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   if (response.destroyed || response.writableEnded) return
-  const body = JSON.stringify(value)
+  const body = JSON.stringify(value, (key, item: unknown) => key === 'goalId' && item === null ? undefined : item)
   response.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
@@ -125,6 +128,33 @@ function optionalText(value: unknown, name: string): string | null | undefined {
   return value as string | null | undefined
 }
 
+function commandId(value: unknown): string {
+  const id = requiredString(value, 'commandId')
+  if (id.length > 200) badRequest('commandId must not exceed 200 characters.')
+  return id
+}
+
+function expectedRevision(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    badRequest('expectedRevision must be a positive safe integer.')
+  }
+  return value
+}
+
+function naturalDate(value: unknown, name: string): string | null | undefined {
+  const text = optionalText(value, name)
+  if (text == null) return text
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) badRequest(`${name} must be YYYY-MM-DD or null.`)
+  const parsed = new Date(`${text}T00:00:00.000Z`)
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== text) {
+    badRequest(`${name} must be a valid YYYY-MM-DD date.`)
+  }
+  return text
+}
+
+const GOAL_STATUSES: GoalStatus[] = ['active', 'completed', 'archived']
+const TASK_STATUSES: TaskStatus[] = ['todo', 'in_progress', 'blocked', 'completed', 'canceled']
+
 function queryFields(url: URL, allowed: string[] = []): void {
   for (const key of url.searchParams.keys()) {
     if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) {
@@ -150,6 +180,16 @@ function messageQuery(url: URL): { after: number; wait: number } {
 
 function resourceId(value: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) badRequest('Resource id is invalid.')
+  return value
+}
+
+function pageInteger(url: URL, key: string, fallback: number, maximum = Number.MAX_SAFE_INTEGER): number {
+  const raw = url.searchParams.get(key)
+  if (raw === null) return fallback
+  const value = Number(raw)
+  if (!/^(0|[1-9]\d*)$/.test(raw) || !Number.isSafeInteger(value) || value > maximum) {
+    badRequest(`${key} must be a non-negative safe integer${maximum === Number.MAX_SAFE_INTEGER ? '' : ` no greater than ${maximum}`}.`)
+  }
   return value
 }
 
@@ -195,7 +235,7 @@ async function pollMessages(
   }
 }
 
-export function createV2Server({ store, adminSecret, model, now = () => new Date() }: V2ServerOptions): Server {
+export function createV2Server({ store, adminSecret, model, goalQuestionsEnabled = false, now = () => new Date() }: V2ServerOptions): Server {
   if (typeof adminSecret !== 'string' || adminSecret.length === 0) {
     throw new TypeError('adminSecret must be a non-empty string.')
   }
@@ -259,6 +299,176 @@ export function createV2Server({ store, adminSecret, model, now = () => new Date
       sendJson(response, 200, { device: publicDevice(device) })
       return
     }
+    if (method === 'GET' && path === '/v2/capabilities') {
+      queryFields(url)
+      sendJson(response, 200, { goalsTasksVersion: 1, goalQuestionsVersion: goalQuestionsEnabled ? 1 : 0 })
+      return
+    }
+    if (path === '/v2/goals' && (method === 'GET' || method === 'POST')) {
+      if (method === 'GET') {
+        queryFields(url, ['status', 'after', 'limit'])
+        const rawStatus = url.searchParams.get('status')
+        if (rawStatus !== null && !GOAL_STATUSES.includes(rawStatus as GoalStatus)) {
+          badRequest('status must be active, completed or archived.')
+        }
+        const after = pageInteger(url, 'after', 0)
+        const limit = pageInteger(url, 'limit', 50, 100)
+        if (limit < 1) badRequest('limit must be between 1 and 100.')
+        sendJson(response, 200, store.listGoals(rawStatus === null ? undefined : rawStatus as GoalStatus, after, limit))
+      } else {
+        if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
+        queryFields(url)
+        const body = await readBody(request)
+        fields(body, ['commandId', 'title', 'description', 'successCriteria', 'targetDate'])
+        const result = store.createGoal({
+          deviceId: device.id,
+          commandId: commandId(body.commandId),
+          title: requiredString(body.title, 'title'),
+          description: optionalText(body.description, 'description'),
+          successCriteria: optionalText(body.successCriteria, 'successCriteria'),
+          targetDate: naturalDate(body.targetDate, 'targetDate'),
+        })
+        sendJson(response, result.created ? 201 : 200, { goal: result.value, created: result.created })
+      }
+      return
+    }
+    const goalCommandsMatch = path.match(/^\/v2\/goals\/([^/]*)\/commands$/)
+    if (goalCommandsMatch && method === 'POST') {
+      if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
+      queryFields(url)
+      const goalId = resourceId(goalCommandsMatch[1])
+      const body = await readBody(request)
+      fields(body, ['commandId', 'expectedRevision', 'action', 'title', 'description', 'successCriteria', 'targetDate'])
+      const common = {
+        deviceId: device.id,
+        commandId: commandId(body.commandId),
+        expectedRevision: expectedRevision(body.expectedRevision),
+      }
+      let input
+      if (body.action === 'update') {
+        fields(body, ['commandId', 'expectedRevision', 'action', 'title', 'description', 'successCriteria', 'targetDate'])
+        if (!['title', 'description', 'successCriteria', 'targetDate'].some(key => key in body)) {
+          badRequest('An update command must include at least one goal field.')
+        }
+        input = {
+          ...common, action: 'update' as const,
+          ...(body.title === undefined ? {} : { title: requiredString(body.title, 'title') }),
+          ...(body.description === undefined ? {} : { description: optionalText(body.description, 'description') }),
+          ...(body.successCriteria === undefined ? {} : { successCriteria: optionalText(body.successCriteria, 'successCriteria') }),
+          ...(body.targetDate === undefined ? {} : { targetDate: naturalDate(body.targetDate, 'targetDate') }),
+        }
+      } else if (body.action === 'complete' || body.action === 'archive' || body.action === 'restore' || body.action === 'reopen') {
+        fields(body, ['commandId', 'expectedRevision', 'action'])
+        input = { ...common, action: body.action as 'complete' | 'archive' | 'restore' | 'reopen' }
+      } else {
+        badRequest('action is invalid.')
+      }
+      const result = store.updateGoal(goalId, input)
+      if (!result) throw new HttpError(404, 'not_found', 'Goal not found.')
+      sendJson(response, 200, { goal: result.value, created: result.created })
+      return
+    }
+    const goalTasksMatch = path.match(/^\/v2\/goals\/([^/]*)\/tasks$/)
+    if (goalTasksMatch && method === 'POST') {
+      if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
+      queryFields(url)
+      const goalId = resourceId(goalTasksMatch[1])
+      const body = await readBody(request)
+      fields(body, ['commandId', 'title', 'description', 'dueDate'])
+      const result = store.createTask(goalId, {
+        deviceId: device.id,
+        commandId: commandId(body.commandId),
+        title: requiredString(body.title, 'title'),
+        description: optionalText(body.description, 'description'),
+        dueDate: naturalDate(body.dueDate, 'dueDate'),
+      })
+      if (!result) throw new HttpError(404, 'not_found', 'Goal not found.')
+      sendJson(response, result.created ? 201 : 200, { task: result.value, created: result.created })
+      return
+    }
+    const goalQuestionMatch = path.match(/^\/v2\/goals\/([^/]*)\/questions$/)
+    if (goalQuestionMatch && method === 'POST') {
+      if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
+      if (!goalQuestionsEnabled) throw new HttpError(409, 'goal_questions_disabled', 'Goal questions are not enabled on this server.')
+      queryFields(url)
+      const goalId = resourceId(goalQuestionMatch[1])
+      if (!store.getGoalView(goalId)) throw new HttpError(404, 'not_found', 'Goal not found.')
+      const body = await readBody(request)
+      fields(body, ['conversationId', 'clientRequestId', 'text'])
+      const conversationId = resourceId(requiredString(body.conversationId, 'conversationId'))
+      if (!store.getConversation(conversationId)) throw new HttpError(404, 'not_found', 'Conversation not found.')
+      const result = store.appendUserMessage({
+        conversationId, role: 'user', clientRequestId: requiredString(body.clientRequestId, 'clientRequestId'),
+        text: requiredString(body.text, 'text'), goalId,
+      })
+      sendJson(response, result.created ? 201 : 200, result)
+      return
+    }
+    const goalViewMatch = path.match(/^\/v2\/goals\/([^/]*)$/)
+    if (goalViewMatch && method === 'GET') {
+      queryFields(url)
+      const view = store.getGoalView(resourceId(goalViewMatch[1]))
+      if (!view) throw new HttpError(404, 'not_found', 'Goal not found.')
+      sendJson(response, 200, { goalView: view })
+      return
+    }
+    const taskCommandsMatch = path.match(/^\/v2\/tasks\/([^/]*)\/commands$/)
+    if (taskCommandsMatch && method === 'POST') {
+      if (device.role !== 'client') throw new HttpError(403, 'forbidden', 'A client device is required.')
+      queryFields(url)
+      const taskId = resourceId(taskCommandsMatch[1])
+      const body = await readBody(request)
+      fields(body, ['commandId', 'expectedRevision', 'action', 'title', 'description', 'dueDate', 'note', 'status', 'resultNote'])
+      const common = {
+        deviceId: device.id,
+        commandId: commandId(body.commandId),
+        expectedRevision: expectedRevision(body.expectedRevision),
+      }
+      let input
+      if (body.action === 'update') {
+        fields(body, ['commandId', 'expectedRevision', 'action', 'title', 'description', 'dueDate'])
+        if (!['title', 'description', 'dueDate'].some(key => key in body)) {
+          badRequest('An update command must include at least one task field.')
+        }
+        input = {
+          ...common, action: 'update' as const,
+          ...(body.title === undefined ? {} : { title: requiredString(body.title, 'title') }),
+          ...(body.description === undefined ? {} : { description: optionalText(body.description, 'description') }),
+          ...(body.dueDate === undefined ? {} : { dueDate: naturalDate(body.dueDate, 'dueDate') }),
+        }
+      } else if (body.action === 'progress') {
+        fields(body, ['commandId', 'expectedRevision', 'action', 'note'])
+        input = { ...common, action: 'progress' as const, note: requiredString(body.note, 'note') }
+      } else if (body.action === 'set_status') {
+        fields(body, ['commandId', 'expectedRevision', 'action', 'status', 'note', 'resultNote'])
+        if (!TASK_STATUSES.includes(body.status as TaskStatus)) badRequest('status is invalid.')
+        input = {
+          ...common, action: 'set_status' as const, status: body.status as TaskStatus,
+          ...(body.note === undefined ? {} : { note: optionalText(body.note, 'note') }),
+          ...(body.resultNote === undefined ? {} : { resultNote: optionalText(body.resultNote, 'resultNote') }),
+        }
+      } else {
+        badRequest('action is invalid.')
+      }
+      const result = store.updateTask(taskId, input)
+      if (!result) throw new HttpError(404, 'not_found', 'Task not found.')
+      sendJson(response, 200, { task: result.value, created: result.created })
+      return
+    }
+    const taskMatch = path.match(/^\/v2\/tasks\/([^/]*)$/)
+    if (taskMatch && method === 'GET') {
+      queryFields(url, ['progressAfter', 'progressLimit', 'progressRevision'])
+      const after = pageInteger(url, 'progressAfter', 0)
+      const limit = pageInteger(url, 'progressLimit', 50, 100)
+      const rawRevision = url.searchParams.get('progressRevision')
+      const revision = rawRevision === null ? undefined : pageInteger(url, 'progressRevision', 1)
+      if (limit < 1 || (revision !== undefined && revision < 1)) badRequest('Progress pagination values must be positive.')
+      if (after > 0 && revision === undefined) badRequest('progressRevision is required for pages after the first.')
+      const task = store.getTask(resourceId(taskMatch[1]), { after, limit, revision })
+      if (!task) throw new HttpError(404, 'not_found', 'Task not found.')
+      sendJson(response, 200, task)
+      return
+    }
     if (path === '/v2/conversations' && (method === 'GET' || method === 'POST')) {
       queryFields(url)
       if (method === 'GET') {
@@ -297,14 +507,26 @@ export function createV2Server({ store, adminSecret, model, now = () => new Date
       queryFields(url)
       if (device.role !== 'agent') throw new HttpError(403, 'forbidden', 'An agent device is required.')
       const body = await readBody(request, true)
-      fields(body, ['leaseMs'])
+      fields(body, ['leaseMs', 'goalQuestionsVersion'])
       const leaseMs = body.leaseMs === undefined ? 30_000 : body.leaseMs
       if (typeof leaseMs !== 'number' || !Number.isSafeInteger(leaseMs) || leaseMs <= 0 || leaseMs > 86_400_000) {
         badRequest('leaseMs must be an integer between 1 and 86400000 milliseconds.')
       }
+      if (body.goalQuestionsVersion !== undefined && body.goalQuestionsVersion !== 1) {
+        badRequest('goalQuestionsVersion, when provided, must be 1.')
+      }
       store.requeueExpiredLeases()
-      const lease = store.leaseRun({ leaseMs })
+      const lease = store.leaseRun({ leaseMs, goalQuestionsVersion: body.goalQuestionsVersion === 1 ? 1 : 0 })
       sendJson(response, 200, lease ?? { run: null, leaseToken: null })
+      return
+    }
+    const goalContextMatch = path.match(/^\/v2\/runs\/([^/]*)\/goal-context$/)
+    if (goalContextMatch && method === 'GET') {
+      queryFields(url)
+      const runId = resourceId(goalContextMatch[1])
+      if (!store.getRun(runId)) throw new HttpError(404, 'not_found', 'Run not found.')
+      const goalContext = store.goalContextForRun(runId)
+      sendJson(response, 200, { goalContext })
       return
     }
     const runMatch = path.match(/^\/v2\/runs\/([^/]*)(?:\/(cancel|complete))?$/)
@@ -347,7 +569,11 @@ export function createV2Server({ store, adminSecret, model, now = () => new Date
     void handle(request, response).catch((error: unknown) => {
       const failure = error instanceof HttpError
         ? error
-        : new HttpError(500, 'internal_error', 'Internal server error.')
+        : error instanceof GoalCommandError
+          ? new HttpError(409, error.code, error.message)
+          : error instanceof TypeError || error instanceof RangeError
+            ? new HttpError(400, 'invalid_request', error.message)
+            : new HttpError(500, 'internal_error', 'Internal server error.')
       sendJson(response, failure.status, { error: { code: failure.code, message: failure.message } })
       if (!request.complete) request.resume()
     })

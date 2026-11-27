@@ -98,6 +98,166 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
         return response.run
     }
 
+    public func capabilities(_ session: AuthSession) async throws -> POSCapabilities {
+        let request = try authorizedRequest(method: "GET", path: "v2/capabilities", session: session)
+        return try decode(POSCapabilities.self, from: await send(request))
+    }
+
+    public func goals(_ session: AuthSession, status: GoalStatus) async throws -> [Goal] {
+        var result: [Goal] = []
+        var after = 0
+        while true {
+            let request = try authorizedRequest(method: "GET", path: "v2/goals", query: [
+                URLQueryItem(name: "status", value: status.rawValue),
+                URLQueryItem(name: "limit", value: "100"), URLQueryItem(name: "after", value: String(after))
+            ], session: session)
+            let page = try decode(GoalsEnvelope.self, from: await send(request))
+            guard page.goals.count <= 100,
+                  page.goals.allSatisfy({ $0.status == status && $0.revision >= 1 && isResourceID($0.id) }) else {
+                throw POSAPIError.decoding("目标列表状态或版本无效")
+            }
+            result.append(contentsOf: page.goals)
+            guard let next = page.nextCursor else { break }
+            guard next > after, !page.goals.isEmpty else { throw POSAPIError.decoding("目标列表分页游标无效") }
+            // 不将有界读取误报为完整列表；保留旧缓存并明确报告限制。
+            guard result.count < 1_000 else { throw POSAPIError.decoding("此状态超过本机 1000 个目标读取上限，列表未完整刷新") }
+            after = next
+        }
+        var byID: [String: Goal] = [:]
+        for goal in result { byID[goal.id] = goal }
+        return byID.values.sorted { $0.id < $1.id }
+    }
+
+    public func goal(_ session: AuthSession, goalID: String) async throws -> GoalDetail {
+        let request = try authorizedRequest(method: "GET", path: goalPath(goalID), session: session)
+        let detail = try decode(GoalViewEnvelope.self, from: await send(request)).goalView
+        guard detail.goal.id == goalID, detail.goal.revision >= 1, detail.viewRevision >= 1,
+              Set(detail.tasks.map(\.id)).count == detail.tasks.count,
+              detail.tasks.allSatisfy({ $0.goalId == goalID && $0.revision >= 1 && isResourceID($0.id) }),
+              detail.summary.completedTasks == detail.tasks.filter({ $0.status == .completed }).count,
+              detail.summary.blockedTasks == detail.tasks.filter({ $0.status == .blocked }).count,
+              detail.summary.canceledTasks == detail.tasks.filter({ $0.status == .canceled }).count,
+              detail.summary.activeTasks == detail.tasks.filter({ $0.status != .canceled }).count,
+              detail.summary.completionPercent.map({ (0...100).contains($0) }) ?? true else {
+            throw POSAPIError.decoding("目标详情与任务汇总不匹配")
+        }
+        return detail
+    }
+
+    public func createGoal(_ session: AuthSession, _ request: CreateGoalRequest) async throws -> Goal {
+        try validateCommandID(request.commandId)
+        let urlRequest = try authorizedRequest(method: "POST", path: "v2/goals", session: session, body: encode(request))
+        let goal = try decode(GoalEnvelope.self, from: await send(urlRequest)).goal
+        guard isResourceID(goal.id), goal.revision >= 1 else { throw POSAPIError.decoding("目标响应无效") }
+        return goal
+    }
+
+    public func updateGoal(_ session: AuthSession, goalID: String, _ command: GoalCommand) async throws -> Goal {
+        try validateCommandID(command.commandId)
+        let request = try authorizedRequest(method: "POST", path: goalPath(goalID) + "/commands",
+            session: session, body: encode(command))
+        let goal = try decode(GoalEnvelope.self, from: await send(request)).goal
+        guard goal.id == goalID, goal.revision >= command.expectedRevision else {
+            throw POSAPIError.decoding("目标命令响应与请求不匹配")
+        }
+        return goal
+    }
+
+    public func createGoalTask(_ session: AuthSession, goalID: String, _ request: CreateGoalTaskRequest) async throws -> GoalTask {
+        try validateCommandID(request.commandId)
+        let urlRequest = try authorizedRequest(method: "POST", path: goalPath(goalID) + "/tasks",
+            session: session, body: encode(request))
+        let task = try decode(GoalTaskEnvelope.self, from: await send(urlRequest)).task
+        guard task.goalId == goalID, task.revision >= 1, isResourceID(task.id) else {
+            throw POSAPIError.decoding("任务响应与目标不匹配")
+        }
+        return task
+    }
+
+    public func updateGoalTask(_ session: AuthSession, taskID: String, _ command: GoalTaskCommand) async throws -> GoalTask {
+        try validateCommandID(command.commandId)
+        guard isResourceID(taskID) else { throw POSAPIError.decoding("任务 ID 无效") }
+        let request = try authorizedRequest(method: "POST", path: "v2/tasks/\(taskID)/commands",
+            session: session, body: encode(command))
+        let task = try decode(GoalTaskEnvelope.self, from: await send(request)).task
+        guard task.id == taskID, isResourceID(task.goalId), task.revision >= command.expectedRevision else {
+            throw POSAPIError.decoding("任务命令响应与请求不匹配")
+        }
+        return task
+    }
+
+    public func goalTask(_ session: AuthSession, taskID: String) async throws -> GoalTaskDetail {
+        guard isResourceID(taskID) else { throw POSAPIError.decoding("任务 ID 无效") }
+        var entries: [GoalProgressEntry] = []
+        var after = 0
+        var revision: Int?
+        while true {
+            var query = [URLQueryItem(name: "progressAfter", value: String(after)), URLQueryItem(name: "progressLimit", value: "100")]
+            if let revision { query.append(URLQueryItem(name: "progressRevision", value: String(revision))) }
+            let request = try authorizedRequest(method: "GET", path: "v2/tasks/\(taskID)", query: query, session: session)
+            let page = try decode(GoalTaskDetail.self, from: await send(request))
+            guard page.task.id == taskID, page.task.revision >= 1, isResourceID(page.task.goalId),
+                  page.progressEntries.count <= 100,
+                  page.progressEntries.allSatisfy({ $0.taskId == taskID }),
+                  revision == nil || revision == page.task.revision else {
+                throw POSAPIError.decoding("任务在读取期间已变化，请刷新进展记录")
+            }
+            revision = page.progressRevision ?? page.task.revision
+            entries.append(contentsOf: page.progressEntries)
+            guard Set(entries.map(\.id)).count == entries.count else { throw POSAPIError.decoding("进展分页记录重复") }
+            if let next = page.nextCursor {
+                guard next > after, !page.progressEntries.isEmpty else { throw POSAPIError.decoding("进展分页游标无效") }
+                if entries.count < 2_000 { after = next; continue }
+            }
+            return GoalTaskDetail(task: page.task, progressEntries: entries, nextCursor: page.nextCursor, progressRevision: revision)
+        }
+    }
+
+    public func askGoal(_ session: AuthSession, goalID: String, _ request: GoalQuestionRequest) async throws -> SendMessageAck {
+        _ = try messagesPath(request.conversationId)
+        try validateCommandID(request.clientRequestId)
+        let urlRequest = try authorizedRequest(method: "POST", path: goalPath(goalID) + "/questions",
+            session: session, body: encode(request))
+        let ack = try decode(SendMessageAck.self, from: await send(urlRequest))
+        guard ack.message.conversationID == request.conversationId,
+              ack.message.clientRequestID == request.clientRequestId,
+              ack.message.role == "user", ack.message.text == request.text,
+              ack.run.conversationId == request.conversationId, ack.run.messageId == ack.message.id,
+              ack.run.goalId == goalID else {
+            throw POSAPIError.decoding("目标问答回执与原消息不匹配")
+        }
+        try validate(ack.run, expectedID: ack.run.id)
+        return ack
+    }
+
+    public func goalContext(_ session: AuthSession, runID: String) async throws -> GoalQuestionContext? {
+        let request = try authorizedRequest(method: "GET", path: runsPath(runID) + "/goal-context", session: session)
+        guard let context = try decode(GoalContextEnvelope.self, from: await send(request)).goalContext else { return nil }
+        guard context.runId == runID, isResourceID(context.goalId), context.goal.id == context.goalId,
+              context.viewRevision >= 1,
+              Set(context.includedTasks.map { $0.task.id }).count == context.includedTasks.count,
+              context.includedTasks.allSatisfy({ item in
+                  item.task.goalId == context.goalId && item.task.revision >= 1 &&
+                      item.progressEntries.allSatisfy { $0.taskId == item.task.id }
+              }) else { throw POSAPIError.decoding("回答依据与本次运行不匹配") }
+        return context
+    }
+
+    private func goalPath(_ goalID: String) throws -> String {
+        guard isResourceID(goalID) else { throw POSAPIError.decoding("目标 ID 无效") }
+        return "v2/goals/\(goalID)"
+    }
+
+    private func isResourceID(_ id: String) -> Bool {
+        id.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil
+    }
+
+    private func validateCommandID(_ id: String) throws {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw POSAPIError.decoding("目标命令缺少幂等键")
+        }
+    }
+
     private func runsPath(_ runID: String) throws -> String {
         guard runID.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else {
             throw POSAPIError.decoding("运行 ID 无效")
@@ -195,6 +355,11 @@ public struct URLSessionPOSAPI: POSAPI, Sendable {
     }
 }
 
+private struct GoalContextEnvelope: Decodable { let goalContext: GoalQuestionContext? }
+private struct GoalsEnvelope: Decodable { let goals: [Goal]; let nextCursor: Int? }
+private struct GoalEnvelope: Decodable { let goal: Goal }
+private struct GoalViewEnvelope: Decodable { let goalView: GoalDetail }
+private struct GoalTaskEnvelope: Decodable { let task: GoalTask }
 private struct DeviceEnvelope: Decodable { let device: DeviceInfo }
 private struct ConversationEnvelope: Decodable { let conversation: Conversation }
 private struct ConversationsEnvelope: Decodable { let conversations: [Conversation] }

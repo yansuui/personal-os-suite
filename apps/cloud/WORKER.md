@@ -31,6 +31,6 @@ URL 不接受 userinfo、query 或 fragment。密钥可直接通过环境变量�
 
 由 `apps/cloud/package.json` 的 worker 脚本启动独立进程。生产环境必须由部署环境安全注入所有必需配置。进程启动时检查 `/v2/health` 的协议版本和 `/v2/me` 的 agent 角色；模型 HTTP redirect 被拒绝，模型响应体最多 1 MiB，Cloud API 响应体最多 8 MiB。上游错误正文、提示词、模型 API key 和 agent token不会写入 run 错误或日志；错误只保留安全类别。
 
-Worker 仅通过 v2 HTTP API 访问云服务，不直接读写 SQLite 或其他 store。上下文按消息分页读取，严格截止被领取 run 的 `messageId`，后续消息不进入旧任务提示；消息数、字符数和输出均有限制。Worker 每次最多处理一个 run。
+Worker 仅通过 v2 HTTP API 访问云服务，不直接读写 SQLite 或其他 store。上下文按消息分页读取，严格截止被领取 run 的 `messageId`，后续消息不进入旧任务提示；消息数、字符数和输出均有限制。目标问答的完整固定资料（含说明文字）计入同一个消息数与字符数预算；空间不足时仅从最早的聊天历史裁起，保留当前问题与完整资料。两者仍无法容纳时，在调用模型前明确失败，不截断或省略固定资料、不降级为普通聊天。Worker 每次最多处理一个 run。
 
 单元与端到端测试只使用 mock transport 或 loopback 本地服务，不会呼叫真实模型。

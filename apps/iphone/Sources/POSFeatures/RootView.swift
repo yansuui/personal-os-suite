@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// v2 仅展示聊天与设备信息；任务、计划、记忆和审批尚未接入。
+/// v2 聊天、可选目标能力与设备信息；旧任务、计划、记忆和审批仍未接入。
 public struct RootView: View {
     @ObservedObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
@@ -26,11 +26,17 @@ struct MainTabView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        TabView {
+        TabView(selection: $model.selectedTab) {
             NavigationStack { AssistantView(model: model) }
-                .tabItem { Label("聊天", systemImage: "bubble.left.and.bubble.right") }
+                .tabItem { Label("聊天", systemImage: "bubble.left.and.bubble.right") }.tag(0)
+            NavigationStack { GoalsView(model: model) }
+                .tabItem { Label("目标", systemImage: "target") }.tag(1)
             NavigationStack { MeView(model: model) }
-                .tabItem { Label("我的", systemImage: "person.crop.circle") }
+                .tabItem { Label("我的", systemImage: "person.crop.circle") }.tag(2)
+        }
+        .onChange(of: model.selectedTab) { _, tab in
+            model.setGoalsTabActive(tab == 1)
+            if tab == 1 { Task { await model.refreshGoals() } }
         }
     }
 }

@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import { hashToken } from '../src/auth.ts'
 import { createV2Server } from '../src/server.ts'
-import type { CloudStoreApi, CompleteRunInput, InsertMessageInput } from '../src/store-api.ts'
+import type { CloudStoreApi, CompleteRunInput, CreateGoalInput, CreateTaskInput, GoalCommandInput, InsertMessageInput, TaskCommandInput } from '../src/store-api.ts'
 import type {
   ConversationRecord, DeviceRecord, DeviceRole, MessageRecord, MessageWithRun, RunLease, RunRecord,
 } from '../src/types.ts'
@@ -83,6 +83,7 @@ class MemoryStore implements CloudStoreApi {
     this.conversations.find((item) => item.id === input.conversationId)!.updatedAt = timestamp
     return { message: { ...message }, run: { ...run }, created: true }
   }
+  goalContextForRun(): null { return null }
   getRun(id: string): RunRecord | null {
     const run = this.runs.find((item) => item.id === id)
     return run ? { ...run } : null
@@ -126,6 +127,13 @@ class MemoryStore implements CloudStoreApi {
     }
     return { ...run }
   }
+  listGoals(_status?: import('../src/types.ts').GoalStatus, _after?: number, _limit?: number): { goals: import('../src/types.ts').GoalListItem[]; nextCursor: number | null } { return { goals: [], nextCursor: null } }
+  getGoalView(_id: string): import('../src/types.ts').GoalView | null { return null }
+  createGoal(_input: CreateGoalInput): import('../src/types.ts').CommandResult<import('../src/types.ts').GoalRecord> { throw new Error('business store not enabled in this test double') }
+  updateGoal(_id: string, _input: GoalCommandInput): import('../src/types.ts').CommandResult<import('../src/types.ts').GoalRecord> | null { return null }
+  createTask(_goalId: string, _input: CreateTaskInput): import('../src/types.ts').CommandResult<import('../src/types.ts').TaskRecord> | null { return null }
+  getTask(_id: string): import('../src/types.ts').TaskView | null { return null }
+  updateTask(_id: string, _input: TaskCommandInput): import('../src/types.ts').CommandResult<import('../src/types.ts').TaskRecord> | null { return null }
   requeueExpiredLeases(): number {
     let count = 0
     for (const run of this.runs) {
