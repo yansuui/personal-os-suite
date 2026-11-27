@@ -80,7 +80,12 @@ final class URLProtocolStubRegistry: @unchecked Sendable {
         let pending = takeSessions()
         for (session, _) in pending {
             session.getAllTasks { tasks in
-                for task in tasks { task.cancel() }
+                for task in tasks {
+                    let wasSuspended = task.state == .suspended
+                    task.cancel()
+                    // 让已取消的挂起任务派发终态回调，避免 finish 一直等待。
+                    if wasSuspended { task.resume() }
+                }
                 session.finishTasksAndInvalidate()
             }
         }
