@@ -12,6 +12,37 @@ struct StubResponse {
     }
 }
 
+/// 等待 URLSession 真正失效，而不只等待调用方的 Task / AsyncStream 结束。
+final class URLProtocolStubSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var invalidated = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitForInvalidation() async {
+        await withCheckedContinuation { register($0) }
+    }
+
+    private func register(_ waiter: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        if invalidated {
+            lock.unlock()
+            waiter.resume()
+        } else {
+            waiters.append(waiter)
+            lock.unlock()
+        }
+    }
+
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        lock.lock()
+        invalidated = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
 /// 全局桩注册表：记录收到的 URLRequest，并把响应交回 URLProtocol。
 ///
 /// 只在测试进程内使用；加锁是因为 URLSession 的回调线程与测试线程不同。
@@ -21,12 +52,34 @@ final class URLProtocolStubRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: ((URLRequest) -> StubResponse)?
     private var recorded: [URLRequest] = []
+    private var sessions: [(URLSession, URLProtocolStubSessionDelegate)] = []
 
     func reset() {
         lock.lock()
         defer { lock.unlock() }
         handler = nil
         recorded = []
+    }
+
+    func trackSession(_ session: URLSession, delegate: URLProtocolStubSessionDelegate) {
+        lock.lock()
+        defer { lock.unlock() }
+        sessions.append((session, delegate))
+    }
+
+    private func takeSessions() -> [(URLSession, URLProtocolStubSessionDelegate)] {
+        lock.lock()
+        defer { lock.unlock() }
+        let pending = sessions
+        sessions = []
+        return pending
+    }
+
+    /// 先取消所有旧 session，再异步等待完成回调，之后才可 reset 共享记录。
+    func invalidateSessions() async {
+        let pending = takeSessions()
+        for (session, _) in pending { session.invalidateAndCancel() }
+        for (_, delegate) in pending { await delegate.waitForInvalidation() }
     }
 
     func setHandler(_ handler: @escaping (URLRequest) -> StubResponse) {
@@ -118,7 +171,10 @@ func makeStubSession() -> URLSession {
     configuration.protocolClasses = [URLProtocolStub.self]
     configuration.urlCache = nil
     configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-    return URLSession(configuration: configuration)
+    let delegate = URLProtocolStubSessionDelegate()
+    let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+    URLProtocolStubRegistry.shared.trackSession(session, delegate: delegate)
+    return session
 }
 
 /// 构造被测 API（所有请求都由 URLProtocolStub 接住，不联网）。

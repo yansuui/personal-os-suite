@@ -4,7 +4,12 @@ import POSCore
 
 final class SyncEngineTests: XCTestCase {
     override func setUp() { super.setUp(); URLProtocolStubRegistry.shared.reset() }
-    override func tearDown() { URLProtocolStubRegistry.shared.reset(); super.tearDown() }
+    override func tearDown() async throws {
+        // stop() 结束事件流时，URLSession 仍可能有已排队的 URLProtocol 回调。
+        await URLProtocolStubRegistry.shared.invalidateSessions()
+        URLProtocolStubRegistry.shared.reset()
+        try await super.tearDown()
+    }
 
     func testMessagesThenCursorAndEmptyPageKeepsCursor() async throws {
         let thirdRequest = expectation(description: "空页后继续使用游标 2")
@@ -70,6 +75,27 @@ final class SyncEngineTests: XCTestCase {
         await engine.stop()
         for await _ in stream {}
         XCTAssertEqual(URLProtocolStubRegistry.shared.requests.first?.stubQueryValue("after"), "11")
+    }
+
+    func testSessionCleanupCancelsQueuedRequestBeforeRegistryReuse() async throws {
+        let cancelled = expectation(description: "旧 session 的排队请求已取消")
+        let session = makeStubSession()
+        let oldRequest = URLRequest(url: URL(string: "http://127.0.0.1:8787/v2/conversations/conv-1/messages?after=0&wait=20")!)
+        let queued = session.dataTask(with: oldRequest) { _, _, error in
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+            cancelled.fulfill()
+        }
+        await URLProtocolStubRegistry.shared.invalidateSessions()
+        await fulfillment(of: [cancelled], timeout: 5)
+
+        URLProtocolStubRegistry.shared.reset()
+        URLProtocolStubRegistry.shared.setHandler { _ in .json(200, Fixtures.messagePage(nextCursor: 6)) }
+        queued.resume()
+        let page = try await makeStubAPI().messages(Fixtures.session(), conversationID: Fixtures.conversationID,
+                                                    after: 6, waitSeconds: 20)
+        XCTAssertEqual(page.nextCursor, 6)
+        XCTAssertEqual(URLProtocolStubRegistry.shared.requests.count, 1)
+        XCTAssertEqual(URLProtocolStubRegistry.shared.requests.first?.stubQueryValue("after"), "6")
     }
 
     func testOfflineDoesNotAnnounceConnectedUntilSuccessfulResponse() async throws {
