@@ -75,10 +75,15 @@ final class URLProtocolStubRegistry: @unchecked Sendable {
         return pending
     }
 
-    /// 先取消所有旧 session，再异步等待完成回调，之后才可 reset 共享记录。
+    /// 取消旧 task，再完成式失效；最后一个 task 结束后才可 reset 共享记录。
     func invalidateSessions() async {
         let pending = takeSessions()
-        for (session, _) in pending { session.invalidateAndCancel() }
+        for (session, _) in pending {
+            session.getAllTasks { tasks in
+                for task in tasks { task.cancel() }
+                session.finishTasksAndInvalidate()
+            }
+        }
         for (_, delegate) in pending { await delegate.waitForInvalidation() }
     }
 
