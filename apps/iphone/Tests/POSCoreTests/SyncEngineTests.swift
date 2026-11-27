@@ -3,11 +3,16 @@ import XCTest
 import POSCore
 
 final class SyncEngineTests: XCTestCase {
-    override func setUp() { super.setUp(); URLProtocolStubRegistry.shared.reset() }
+    override func setUp() { super.setUp(); XCTAssertTrue(URLProtocolStubRegistry.shared.reset()) }
     override func tearDown() async throws {
         // stop() 结束事件流时，URLSession 仍可能有已排队的 URLProtocol 回调。
-        await URLProtocolStubRegistry.shared.invalidateSessions()
-        URLProtocolStubRegistry.shared.reset()
+        do {
+            try await URLProtocolStubRegistry.shared.invalidateSessions()
+        } catch {
+            try await super.tearDown()
+            throw error
+        }
+        XCTAssertTrue(URLProtocolStubRegistry.shared.reset())
         try await super.tearDown()
     }
 
@@ -80,15 +85,19 @@ final class SyncEngineTests: XCTestCase {
     func testSessionCleanupCancelsQueuedRequestBeforeRegistryReuse() async throws {
         let cancelled = expectation(description: "旧 session 的排队请求已取消")
         let session = makeStubSession()
+        let cleanupDelegate = try XCTUnwrap(session.delegate as? URLProtocolStubSessionDelegate)
+        cleanupDelegate.expectTaskCompletion()
         let oldRequest = URLRequest(url: URL(string: "http://127.0.0.1:8787/v2/conversations/conv-1/messages?after=0&wait=20")!)
         let queued = session.dataTask(with: oldRequest) { _, _, error in
             XCTAssertEqual((error as? URLError)?.code, .cancelled)
             cancelled.fulfill()
+            cleanupDelegate.taskCompleted()
         }
-        await URLProtocolStubRegistry.shared.invalidateSessions()
+        try await URLProtocolStubRegistry.shared.invalidateSessions()
         await fulfillment(of: [cancelled], timeout: 5)
+        XCTAssertTrue(cleanupDelegate.isCleanupComplete)
 
-        URLProtocolStubRegistry.shared.reset()
+        XCTAssertTrue(URLProtocolStubRegistry.shared.reset())
         URLProtocolStubRegistry.shared.setHandler { _ in .json(200, Fixtures.messagePage(nextCursor: 6)) }
         queued.resume()
         let page = try await makeStubAPI().messages(Fixtures.session(), conversationID: Fixtures.conversationID,
@@ -96,6 +105,73 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(page.nextCursor, 6)
         XCTAssertEqual(URLProtocolStubRegistry.shared.requests.count, 1)
         XCTAssertEqual(URLProtocolStubRegistry.shared.requests.first?.stubQueryValue("after"), "6")
+    }
+
+    func testSessionCleanupTimeoutPreservesRegistryUntilCallbacksDrain() async {
+        let registry = URLProtocolStubRegistry()
+        let cleanupDelegate = URLProtocolStubSessionDelegate()
+        // 故意不把 delegate 交给 session：它不会自动收到失效回调。
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        registry.trackSession(session, delegate: cleanupDelegate)
+        cleanupDelegate.expectTaskCompletion()
+        registry.setHandler { _ in .json(200, "{}") }
+        _ = registry.respond(to: URLRequest(url: URL(string: "http://stub.invalid/old")!))
+        let finished = expectation(description: "缺少回调时清理应有界失败，排空后可恢复")
+        let cleanup = Task {
+            defer { finished.fulfill() }
+            do {
+                for invalidated in [false, true] {
+                    if invalidated { cleanupDelegate.urlSession(session, didBecomeInvalidWithError: nil) }
+                    do {
+                        try await registry.invalidateSessions(timeout: 0.05)
+                        XCTFail("缺少失效或 completion 回调时不能将清理判为成功")
+                        return
+                    } catch let error as URLProtocolStubCleanupError {
+                        XCTAssertEqual(error.waitResult, .timedOut)
+                        XCTAssertEqual(error.invalidated, invalidated)
+                        XCTAssertEqual(error.pendingCompletions, 1)
+                    }
+                    XCTAssertFalse(registry.reset(reportFailure: false), "未排空时必须保留旧注册表")
+                    XCTAssertEqual(registry.requests.count, 1)
+                }
+                cleanupDelegate.taskCompleted()
+                try await registry.invalidateSessions(timeout: 1)
+                XCTAssertTrue(cleanupDelegate.isCleanupComplete)
+                XCTAssertTrue(registry.reset(), "实际排空后应允许恢复复用")
+                XCTAssertTrue(registry.requests.isEmpty)
+            } catch {
+                XCTFail("清理失败类型或恢复结果不符：\(error)")
+            }
+        }
+        defer { cleanup.cancel() }
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 5)
+        guard result == .completed else {
+            XCTFail("有界清理未能返回：\(result)")
+            return
+        }
+    }
+
+    func testSessionCleanupWaitsForInvalidationAfterCompletion() async throws {
+        let cleanupDelegate = URLProtocolStubSessionDelegate()
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        cleanupDelegate.expectTaskCompletion()
+        cleanupDelegate.taskCompleted()
+        XCTAssertFalse(cleanupDelegate.isCleanupComplete)
+
+        do {
+            try await cleanupDelegate.waitForInvalidation(timeout: 0.05)
+            XCTFail("completion 先返回时仍须等待 session 失效")
+        } catch let error as URLProtocolStubCleanupError {
+            XCTAssertEqual(error.waitResult, .timedOut)
+            XCTAssertFalse(error.invalidated)
+            XCTAssertEqual(error.pendingCompletions, 0)
+        }
+
+        cleanupDelegate.urlSession(session, didBecomeInvalidWithError: nil)
+        try await cleanupDelegate.waitForInvalidation(timeout: 1)
+        XCTAssertTrue(cleanupDelegate.isCleanupComplete)
     }
 
     func testOfflineDoesNotAnnounceConnectedUntilSuccessfulResponse() async throws {

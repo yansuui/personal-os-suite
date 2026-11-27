@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 import POSCore
 
 /// 桩响应：状态码 + 头 + 体。
@@ -12,34 +13,97 @@ struct StubResponse {
     }
 }
 
-/// 等待 URLSession 真正失效，而不只等待调用方的 Task / AsyncStream 结束。
+struct URLProtocolStubCleanupError: Error, CustomStringConvertible {
+    let waitResult: XCTWaiter.Result
+    let invalidated: Bool
+    let pendingCompletions: Int
+    let timeout: TimeInterval
+
+    var description: String {
+        "URLSession 清理未完成：waiter=\(waitResult)，didBecomeInvalid=\(invalidated)，待 completion=\(pendingCompletions)，等待上限=\(timeout)s"
+    }
+}
+
+/// 等待 session 失效及测试明确登记的 completion，不假设二者回调顺序。
 final class URLProtocolStubSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var invalidated = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingCompletions = 0
+    private var waiters: [XCTestExpectation] = []
 
-    func waitForInvalidation() async {
-        await withCheckedContinuation { register($0) }
+    var isCleanupComplete: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return invalidated && pendingCompletions == 0
     }
 
-    private func register(_ waiter: CheckedContinuation<Void, Never>) {
+    func expectTaskCompletion() {
         lock.lock()
-        if invalidated {
+        pendingCompletions += 1
+        lock.unlock()
+    }
+
+    func taskCompleted() {
+        lock.lock()
+        guard pendingCompletions > 0 else {
             lock.unlock()
-            waiter.resume()
+            XCTFail("收到未登记或重复的 task completion")
+            return
+        }
+        pendingCompletions -= 1
+        let pending = takeReadyWaiters()
+        lock.unlock()
+        for waiter in pending { waiter.fulfill() }
+    }
+
+    func waitForInvalidation(timeout: TimeInterval = 5) async throws {
+        let waiter = XCTestExpectation(description: "session 失效且已登记 completion 排空")
+        register(waiter)
+        defer { unregister(waiter) }
+        let result = await XCTWaiter.fulfillment(of: [waiter], timeout: timeout)
+        guard result == .completed, isCleanupComplete else {
+            throw cleanupError(result, timeout: timeout)
+        }
+    }
+
+    private func register(_ waiter: XCTestExpectation) {
+        lock.lock()
+        if invalidated && pendingCompletions == 0 {
+            lock.unlock()
+            waiter.fulfill()
         } else {
             waiters.append(waiter)
             lock.unlock()
         }
     }
 
+    private func unregister(_ waiter: XCTestExpectation) {
+        lock.lock()
+        defer { lock.unlock() }
+        waiters.removeAll { $0 === waiter }
+    }
+
+    /// 调用方已持有 lock。
+    private func takeReadyWaiters() -> [XCTestExpectation] {
+        guard invalidated && pendingCompletions == 0 else { return [] }
+        let pending = waiters
+        waiters = []
+        return pending
+    }
+
+    private func cleanupError(_ result: XCTWaiter.Result, timeout: TimeInterval) -> URLProtocolStubCleanupError {
+        lock.lock()
+        defer { lock.unlock() }
+        return URLProtocolStubCleanupError(waitResult: result, invalidated: invalidated,
+            pendingCompletions: pendingCompletions, timeout: timeout)
+    }
+
     func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
         lock.lock()
         invalidated = true
-        let pending = waiters
-        waiters = []
+        let pending = takeReadyWaiters()
         lock.unlock()
-        for waiter in pending { waiter.resume() }
+        for waiter in pending { waiter.fulfill() }
     }
 }
 
@@ -47,18 +111,31 @@ final class URLProtocolStubSessionDelegate: NSObject, URLSessionDelegate, @unche
 ///
 /// 只在测试进程内使用；加锁是因为 URLSession 的回调线程与测试线程不同。
 final class URLProtocolStubRegistry: @unchecked Sendable {
+    private enum CleanupError: Error { case alreadyInProgress }
+
     static let shared = URLProtocolStubRegistry()
 
     private let lock = NSLock()
     private var handler: ((URLRequest) -> StubResponse)?
     private var recorded: [URLRequest] = []
     private var sessions: [(URLSession, URLProtocolStubSessionDelegate)] = []
+    private var pendingCleanup: [(URLSession, URLProtocolStubSessionDelegate)] = []
+    private var cleanupInProgress = false
 
-    func reset() {
+    /// 清理未实际排空时报告失败并保留旧状态；负向测试可关闭预期失败的报告。
+    @discardableResult
+    func reset(reportFailure: Bool = true) -> Bool {
         lock.lock()
+        guard !cleanupInProgress, pendingCleanup.allSatisfy({ $0.1.isCleanupComplete }) else {
+            lock.unlock()
+            if reportFailure { XCTFail("旧 session 尚未排空，不能 reset 桩注册表") }
+            return false
+        }
         defer { lock.unlock() }
+        pendingCleanup = []
         handler = nil
         recorded = []
+        return true
     }
 
     func trackSession(_ session: URLSession, delegate: URLProtocolStubSessionDelegate) {
@@ -67,35 +144,57 @@ final class URLProtocolStubRegistry: @unchecked Sendable {
         sessions.append((session, delegate))
     }
 
-    private func takeSessions() -> [(URLSession, URLProtocolStubSessionDelegate)] {
+    private func takeSessions() throws -> [(URLSession, URLProtocolStubSessionDelegate)] {
         lock.lock()
         defer { lock.unlock() }
+        guard !cleanupInProgress else { throw CleanupError.alreadyInProgress }
+        cleanupInProgress = true
         let pending = sessions
         sessions = []
+        pendingCleanup = pending
         return pending
     }
 
-    /// 取消旧 task，再完成式失效；最后一个 task 结束后才可 reset 共享记录。
-    func invalidateSessions() async {
-        let pending = takeSessions()
-        for (session, _) in pending {
-            session.getAllTasks { tasks in
-                for task in tasks {
-                    let wasSuspended = task.state == .suspended
-                    task.cancel()
-                    // 让已取消的挂起任务派发终态回调，避免 finish 一直等待。
-                    if wasSuspended { task.resume() }
-                }
-                session.finishTasksAndInvalidate()
+    private func restoreSessionsAfterFailure(_ pending: [(URLSession, URLProtocolStubSessionDelegate)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        sessions.append(contentsOf: pending)
+        cleanupInProgress = false
+    }
+
+    private func markCleanupComplete() {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingCleanup = []
+        cleanupInProgress = false
+    }
+
+    /// 取消整个 session；失效和已登记 completion 都排空后才可复用注册表。
+    func invalidateSessions(timeout: TimeInterval = 5) async throws {
+        let pending = try takeSessions()
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        for (session, _) in pending { session.invalidateAndCancel() }
+        do {
+            for (_, delegate) in pending {
+                let remaining = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+                try await delegate.waitForInvalidation(timeout: remaining)
             }
+            markCleanupComplete()
+        } catch {
+            restoreSessionsAfterFailure(pending)
+            throw error
         }
-        for (_, delegate) in pending { await delegate.waitForInvalidation() }
     }
 
     func setHandler(_ handler: @escaping (URLRequest) -> StubResponse) {
         lock.lock()
-        defer { lock.unlock() }
+        guard !cleanupInProgress, pendingCleanup.allSatisfy({ $0.1.isCleanupComplete }) else {
+            lock.unlock()
+            XCTFail("旧 session 尚未排空，不能更换桩 handler")
+            return
+        }
         self.handler = handler
+        lock.unlock()
     }
 
     var requests: [URLRequest] {
